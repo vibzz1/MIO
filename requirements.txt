@@ -3,4 +3,4 @@ yfinance
 pandas
 pandas-ta
 nselib
-mplfinance
+plotly
