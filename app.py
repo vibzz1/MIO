@@ -122,9 +122,8 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 
                 df_chart = res['chart_data']
                 apdict = [
-                    mpf.make_addplot(df_chart['SMA_10'], color='blue', width=1.2),
                     mpf.make_addplot(df_chart['SMA_20'], color='orange', width=1.2),
-                    mpf.make_addplot(df_chart['SMA_50'], color='red', width=1.2)
+                    
                 ]
                 
                 # returnfig=True is required to pass the chart to Streamlit
