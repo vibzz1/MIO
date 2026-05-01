@@ -7,6 +7,7 @@ import warnings
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from nselib import capital_market
+from functools import partial
 
 warnings.filterwarnings("ignore")
 
@@ -15,7 +16,7 @@ st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
 st.markdown("Automated scan for high-probability momentum setups.")
 
-# --- Data Fetching ---
+# --- Data Fetching & Industry Mapping ---
 @st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
@@ -24,8 +25,13 @@ def get_nifty_500():
         mid150 = capital_market.niftymidcap150_equity_list()
         sml250 = capital_market.niftysmallcap250_equity_list()
         df = pd.concat([n50, nn50, mid150, sml250], ignore_index=True)
-        return list(set(df['Symbol'].tolist()))
-    except: return []
+        
+        tickers = list(set(df['Symbol'].tolist()))
+        # Build an official NSE industry dictionary so we don't rely on Yahoo Finance
+        ind_map = dict(zip(df['Symbol'], df['Industry']))
+        
+        return tickers, ind_map
+    except: return [], {}
 
 @st.cache_data(ttl=3600)
 def get_all_nse():
@@ -33,15 +39,19 @@ def get_all_nse():
         df = capital_market.equity_list()
         df.columns = df.columns.str.upper() 
         raw = df['SYMBOL'].tolist()
-        return list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
-    except: return []
+        tickers = list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
+        
+        # Borrow the industry map from the top 500 as a baseline 
+        _, ind_map = get_nifty_500()
+        
+        return tickers, ind_map
+    except: return [], {}
 
 # --- Screener Logic ---
-def check_stock(ticker):
+def check_stock(ticker, ind_map):
     symbol = f"{ticker}.NS"
     try:
         stock = yf.Ticker(symbol)
-        # INCREASED TO 1 YEAR: Gives you more data to zoom out and look at the macro trend
         df = stock.history(period="1y")
         if len(df) < 70: return None 
 
@@ -73,9 +83,15 @@ def check_stock(ticker):
         c10 = latest['Close'] > (latest['Low'] + ((latest['High'] - latest['Low']) * 0.4))
 
         if all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]):
-            try: industry = stock.info.get('industry', 'N/A')
-            except: industry = 'N/A'
-            # Now returning the full 1-year dataframe instead of cutting it off at 100 days
+            
+            # Check our local NSE map first to bypass YF rate limits
+            industry = ind_map.get(ticker)
+            
+            # If it's an obscure micro-cap not in the 500, fallback to YF
+            if not industry or pd.isna(industry):
+                try: industry = stock.info.get('industry', 'N/A')
+                except: industry = 'N/A'
+                
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
     except: pass
@@ -85,7 +101,11 @@ def check_stock(ticker):
 scan_mode = st.radio("Select Market Universe:", ["Nifty 500 (Fast)", "All NSE Stocks (~2,200 Stocks, Slower)"])
 
 if st.button("🚀 Run Market Scan", type="primary"):
-    tickers = get_nifty_500() if "Nifty 500" in scan_mode else get_all_nse()
+    
+    if "Nifty 500" in scan_mode:
+        tickers, ind_map = get_nifty_500()
+    else:
+        tickers, ind_map = get_all_nse()
     
     if not tickers:
         st.error("Failed to pull market data. The NSE server might be busy.")
@@ -95,8 +115,11 @@ if st.button("🚀 Run Market Scan", type="primary"):
         passed_results = []
         progress_bar = st.progress(0)
         
+        # Package the check_stock function with our industry map so threads can use it safely
+        check_func = partial(check_stock, ind_map=ind_map)
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-            results = executor.map(check_stock, tickers)
+            results = executor.map(check_func, tickers)
             for i, result in enumerate(results):
                 if result: passed_results.append(result)
                 progress_bar.progress(min((i + 1) / len(tickers), 1.0))
@@ -120,31 +143,31 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
                 df_chart = res['chart_data']
                 
-                # Create a 2-row layout: Top for Price, Bottom for Volume
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                     vertical_spacing=0.03, row_heights=[0.7, 0.3])
 
-                # 1. Candlestick Chart
+                # 1. Vibrant, Solid Candlesticks
                 fig.add_trace(go.Candlestick(x=df_chart.index,
                                 open=df_chart['Open'], high=df_chart['High'],
                                 low=df_chart['Low'], close=df_chart['Close'],
-                                name='Price'), row=1, col=1)
+                                name='Price',
+                                increasing_line_color='#00b060', increasing_fillcolor='#00b060',
+                                decreasing_line_color='#ff333a', decreasing_fillcolor='#ff333a'), 
+                                row=1, col=1)
 
                 # 2. Add 20 DMA (Orange Line)
                 fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA_20'], 
                                          line=dict(color='orange', width=1.5), 
                                          name='20 DMA'), row=1, col=1)
 
-                # 3. Volume Bar Chart (Green for Up days, Red for Down days)
+                # 3. Volume Bar Chart
                 colors = ['#00b060' if row['Close'] >= row['Open'] else '#ff333a' for index, row in df_chart.iterrows()]
                 fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['Volume'], 
                                      marker_color=colors, name='Volume'), row=2, col=1)
 
-                # Clean up the layout
                 fig.update_layout(height=600, showlegend=False, margin=dict(l=20, r=20, t=20, b=20))
-                fig.update_xaxes(rangeslider_visible=False) # Hides the bulky default slider so you can just use mouse scroll
+                fig.update_xaxes(rangeslider_visible=False)
                 
-                # Render the interactive chart
                 st.plotly_chart(fig, use_container_width=True)
                 st.markdown("---")
         else:
