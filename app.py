@@ -4,7 +4,8 @@ import pandas as pd
 import pandas_ta as ta
 import concurrent.futures
 import warnings
-import mplfinance as mpf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from nselib import capital_market
 
 warnings.filterwarnings("ignore")
@@ -14,8 +15,8 @@ st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
 st.markdown("Automated scan for high-probability momentum setups.")
 
-# --- Data Fetching (Cached for speed) ---
-@st.cache_data(ttl=3600) # Caches the list for 1 hour so it doesn't re-download every click
+# --- Data Fetching ---
+@st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
         n50 = capital_market.nifty50_equity_list()
@@ -40,7 +41,8 @@ def check_stock(ticker):
     symbol = f"{ticker}.NS"
     try:
         stock = yf.Ticker(symbol)
-        df = stock.history(period="6mo")
+        # INCREASED TO 1 YEAR: Gives you more data to zoom out and look at the macro trend
+        df = stock.history(period="1y")
         if len(df) < 70: return None 
 
         df.dropna(inplace=True)
@@ -59,7 +61,6 @@ def check_stock(ticker):
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # Goldilocks Logic
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
         c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all()
@@ -74,7 +75,8 @@ def check_stock(ticker):
         if all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]):
             try: industry = stock.info.get('industry', 'N/A')
             except: industry = 'N/A'
-            return {"Ticker": ticker, "Industry": industry, "chart_data": df.tail(100)}
+            # Now returning the full 1-year dataframe instead of cutting it off at 100 days
+            return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
     except: pass
     return None
@@ -91,14 +93,12 @@ if st.button("🚀 Run Market Scan", type="primary"):
         st.info(f"Crunching {len(tickers)} stocks... Please wait 60-90 seconds.")
         
         passed_results = []
-        # Progress bar for the web UI
         progress_bar = st.progress(0)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
             results = executor.map(check_stock, tickers)
             for i, result in enumerate(results):
                 if result: passed_results.append(result)
-                # Update progress bar
                 progress_bar.progress(min((i + 1) / len(tickers), 1.0))
                 
         progress_bar.empty()
@@ -106,32 +106,46 @@ if st.button("🚀 Run Market Scan", type="primary"):
         if passed_results:
             st.success(f"🔥 Found {len(passed_results)} setups!")
             
-            # --- 1. LIST VIEW (Interactive Table) ---
+            # --- 1. LIST VIEW ---
             st.subheader("📋 List View")
-            # Create a clean dataframe for the web table
             df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
             df_results.index = df_results.index + 1
             st.dataframe(df_results, use_container_width=True)
 
             st.divider()
 
-            # --- 2. CHART VIEW ---
-            st.subheader("📊 Chart View")
+            # --- 2. INTERACTIVE CHART VIEW ---
+            st.subheader("📊 Interactive Chart View (Scroll to Zoom, Click & Drag to Pan)")
             for res in passed_results:
                 st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
-                
                 df_chart = res['chart_data']
-                apdict = [
-                    mpf.make_addplot(df_chart['SMA_20'], color='orange', width=1.2),
-                    
-                ]
                 
-                # returnfig=True is required to pass the chart to Streamlit
-                fig, axlist = mpf.plot(
-                    df_chart, type='candle', addplot=apdict, style='yahoo', 
-                    volume=True, figsize=(12, 5), returnfig=True
-                )
-                st.pyplot(fig)
-                st.markdown("---") # Adds a clean visual break between charts
+                # Create a 2-row layout: Top for Price, Bottom for Volume
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                    vertical_spacing=0.03, row_heights=[0.7, 0.3])
+
+                # 1. Candlestick Chart
+                fig.add_trace(go.Candlestick(x=df_chart.index,
+                                open=df_chart['Open'], high=df_chart['High'],
+                                low=df_chart['Low'], close=df_chart['Close'],
+                                name='Price'), row=1, col=1)
+
+                # 2. Add 20 DMA (Orange Line)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA_20'], 
+                                         line=dict(color='orange', width=1.5), 
+                                         name='20 DMA'), row=1, col=1)
+
+                # 3. Volume Bar Chart (Green for Up days, Red for Down days)
+                colors = ['#00b060' if row['Close'] >= row['Open'] else '#ff333a' for index, row in df_chart.iterrows()]
+                fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['Volume'], 
+                                     marker_color=colors, name='Volume'), row=2, col=1)
+
+                # Clean up the layout
+                fig.update_layout(height=600, showlegend=False, margin=dict(l=20, r=20, t=20, b=20))
+                fig.update_xaxes(rangeslider_visible=False) # Hides the bulky default slider so you can just use mouse scroll
+                
+                # Render the interactive chart
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
         else:
             st.warning("No stocks matched the criteria today.")
