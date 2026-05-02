@@ -2,6 +2,6 @@ streamlit
 pandas
 pandas-ta
 nselib
-dhanhq==2.0.2
+dhanhq
 streamlit-lightweight-charts
 requests
