@@ -162,6 +162,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 ).to_dict('records')
                 
                 sma20 = df_plot[['time', 'SMA_20']].dropna().rename(
+                    columns={'': 'value'}
                     
                 ).to_dict('records')
 
