@@ -7,7 +7,7 @@ from streamlit_lightweight_charts import renderLightweightCharts
 from nselib import capital_market
 from functools import partial
 import datetime
-from dhanhq import dhanhq
+from dhanhq import dhanhq, DhanContext
 import requests
 import io
 import time
@@ -19,13 +19,15 @@ st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
 st.markdown("Automated scan for high-probability momentum setups using institutional Dhan API data.")
 
-# --- API Credentials (Input via Streamlit Sidebar) ---
+# --- API Credentials ---
 st.sidebar.header("🔑 Dhan API Settings")
 client_id = st.sidebar.text_input("Client ID", type="password")
 access_token = st.sidebar.text_input("Access Token", type="password")
 
 if client_id and access_token:
-    dhan = dhanhq(client_id, access_token)
+    # UPDATED: Dhan's newest library requires DhanContext to log in
+    dhan_context = DhanContext(client_id, access_token)
+    dhan = dhanhq(dhan_context)
 else:
     st.sidebar.warning("Please enter your Dhan API credentials to run the scan.")
 
@@ -70,7 +72,7 @@ def get_all_nse():
         st.error(f"🚨 NSE Server Error: {e}")
         return [], {}
 
-# --- The Engine (Powered by Dhan API) ---
+# --- The Engine ---
 def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
     sec_id = sec_map.get(ticker)
     if not sec_id: return None
@@ -79,7 +81,6 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
         target_dt = pd.to_datetime(target_date)
         from_date = target_dt - datetime.timedelta(days=250)
         
-        # Fixed: Dhan v2.0.2 requires historical_daily_data with security_id
         req = dhan_client.historical_daily_data(
             security_id=str(sec_id),
             exchange_segment='NSE_EQ',
@@ -90,13 +91,10 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
         )
         
         if req.get('status') != 'success' or not req.get('data') or len(req['data'].get('close', [])) == 0:
-            return None
+            return {"error": f"Dhan API rejected {ticker} (Data empty or rate limit)"}
             
         data = req['data']
-        
-        # Fixed: Dhan v2 uses 'timestamp' in epoch seconds
         time_keys = data.get('timestamp') or data.get('start_Time')
-        if not time_keys: return None
         
         try:
             dt_index = pd.to_datetime(time_keys, unit='s')
@@ -111,7 +109,7 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             'Volume': pd.to_numeric(data['volume'])
         }, index=dt_index)
         
-        df.sort_index(inplace=True) # Critical: Forces oldest-to-newest order for accurate MAs
+        df.sort_index(inplace=True) 
         
         if len(df) < 70: return None
 
@@ -132,7 +130,7 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
 
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        # Reverted back to the relaxed 5-day rule to match your earlier results
+        # Reverted back to the relaxed 5-day rule 
         c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all() 
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
@@ -147,9 +145,11 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
     except Exception as e:
-        pass 
+        # We no longer "pass" errors. We log them so we can see what breaks.
+        return {"error": f"Code crash on {ticker}: {str(e)}"}
     
-    time.sleep(0.15) 
+    # 🚨 STRICT THROTTLE: Keeps us under 5 requests per second to avoid API bans
+    time.sleep(0.5) 
     return None
 
 # --- Dashboard Controls ---
@@ -175,20 +175,31 @@ if st.button("🚀 Run Market Scan", type="primary"):
         if not tickers or not sec_map:
             st.error("Failed to pull required data. Check the error messages above.")
         else:
-            st.info(f"Crunching {len(tickers)} stocks via Dhan API... This will take a few minutes.")
+            st.info(f"Crunching stocks via Dhan API... Processing 2 stocks per second to avoid rate limits.")
             
             passed_results = []
+            api_errors = []
             progress_bar = st.progress(0)
             
             check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, sec_map=sec_map, dhan_client=dhan)
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # LOCKED to 2 workers to ensure we stay under the API limit
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 results = executor.map(check_func, tickers)
                 for i, result in enumerate(results):
-                    if result: passed_results.append(result)
+                    if result:
+                        if "error" in result:
+                            api_errors.append(result["error"])
+                        else:
+                            passed_results.append(result)
                     progress_bar.progress(min((i + 1) / len(tickers), 1.0))
                     
             progress_bar.empty()
+
+            if api_errors:
+                with st.expander("⚠️ View API Errors (Rate limits or missing data)"):
+                    for err in api_errors[:20]: # Show top 20 errors so it doesn't crash the UI
+                        st.write(err)
 
             if passed_results:
                 st.success(f"🔥 Found {len(passed_results)} setups on {target_date.strftime('%B %d, %Y')}!")
