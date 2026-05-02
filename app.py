@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 # --- UI Setup ---
 st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
-st.markdown("Automated scan for high-probability momentum setups using Dhan API.")
+st.markdown("Automated scan for high-probability momentum setups using institutional Dhan API data.")
 
 # --- API Credentials (Input via Streamlit Sidebar) ---
 st.sidebar.header("🔑 Dhan API Settings")
@@ -33,14 +33,15 @@ else:
 @st.cache_data(ttl=86400) 
 def get_dhan_security_map():
     url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-    # Added User-Agent header to bypass Dhan/Cloudflare bot protection
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status() # Force an error if the download fails
+        response.raise_for_status() 
         df = pd.read_csv(io.StringIO(response.text), low_memory=False)
-        nse_eq = df[(df['EXCH_ID'] == 'NSE') & (df['INSTRUMENT'] == 'EQUITY')]
-        return dict(zip(nse_eq['SEM_CUSTOM_SYMBOL'], nse_eq['SEM_SMST_SECURITY_ID']))
+        
+        # Rigorous mapping using Dhan's exact internal column IDs
+        nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')]
+        return dict(zip(nse_eq['SM_SYMBOL_NAME'], nse_eq['SEM_SMST_SECURITY_ID']))
     except Exception as e:
         st.error(f"🚨 Dhan Security Master Error: {e}")
         return {}
@@ -53,11 +54,9 @@ def get_nifty_500():
         mid150 = capital_market.niftymidcap150_equity_list()
         sml250 = capital_market.niftysmallcap250_equity_list()
         df = pd.concat([n50, nn50, mid150, sml250], ignore_index=True)
-        tickers = list(set(df['Symbol'].tolist()))
-        ind_map = dict(zip(df['Symbol'], df['Industry']))
-        return tickers, ind_map
+        return list(set(df['Symbol'].tolist())), dict(zip(df['Symbol'], df['Industry']))
     except Exception as e:
-        st.error(f"🚨 NSE Server Error (Nifty 500): {e}. The NSE website might be down for weekend maintenance.")
+        st.error(f"🚨 NSE Server Error: {e}")
         return [], {}
 
 @st.cache_data(ttl=3600)
@@ -67,43 +66,19 @@ def get_all_nse():
         df.columns = df.columns.str.upper() 
         raw = df['SYMBOL'].tolist()
         tickers = list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
-        _, ind_map = get_nifty_500()
+        _, ind_map = get_nifty_500() # Borrow industry map
         return tickers, ind_map
     except Exception as e:
-        st.error(f"🚨 NSE Server Error (All NSE): {e}. The NSE website might be down for weekend maintenance.")
+        st.error(f"🚨 NSE Server Error: {e}")
         return [], {}
-@st.cache_data(ttl=3600)
-def get_nifty_500():
-    try:
-        n50 = capital_market.nifty50_equity_list()
-        nn50 = capital_market.niftynext50_equity_list()
-        mid150 = capital_market.niftymidcap150_equity_list()
-        sml250 = capital_market.niftysmallcap250_equity_list()
-        df = pd.concat([n50, nn50, mid150, sml250], ignore_index=True)
-        tickers = list(set(df['Symbol'].tolist()))
-        ind_map = dict(zip(df['Symbol'], df['Industry']))
-        return tickers, ind_map
-    except: return [], {}
 
-@st.cache_data(ttl=3600)
-def get_all_nse():
-    try:
-        df = capital_market.equity_list()
-        df.columns = df.columns.str.upper() 
-        raw = df['SYMBOL'].tolist()
-        tickers = list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
-        _, ind_map = get_nifty_500()
-        return tickers, ind_map
-    except: return [], {}
-
-# --- The Engine (Powered by Dhan) ---
+# --- The Engine (Powered by Dhan API) ---
 def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
     sec_id = sec_map.get(ticker)
     if not sec_id: return None
 
     try:
-        # Dhan Historical Data API Call
-        # We fetch 250 days of data ending on the target date
+        # Time Machine Logic & Dhan Request Limits
         target_dt = pd.to_datetime(target_date)
         from_date = target_dt - datetime.timedelta(days=250)
         
@@ -116,20 +91,24 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             to_date=target_dt.strftime('%Y-%m-%d')
         )
         
-        if req.get('status') != 'success' or not req.get('data'):
+        # Rigorous Error Catching: Skip if Dhan returns empty data
+        if req.get('status') != 'success' or not req.get('data') or len(req['data']['close']) == 0:
             return None
             
         data = req['data']
+        
+        # Force numeric data types to prevent calculation crashes
         df = pd.DataFrame({
-            'Open': data['open'],
-            'High': data['high'],
-            'Low': data['low'],
-            'Close': data['close'],
-            'Volume': data['volume']
+            'Open': pd.to_numeric(data['open']),
+            'High': pd.to_numeric(data['high']),
+            'Low': pd.to_numeric(data['low']),
+            'Close': pd.to_numeric(data['close']),
+            'Volume': pd.to_numeric(data['volume'])
         }, index=pd.to_datetime(data['start_Time']))
         
         if len(df) < 70: return None
 
+        # Indicator Math
         df['SMA_10'] = ta.sma(df['Close'], length=10)
         df['SMA_20'] = ta.sma(df['Close'], length=20)
         df['SMA_50'] = ta.sma(df['Close'], length=50)
@@ -142,13 +121,12 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
         if len(df) < 22: return None
 
         sma50_trend_dn_20 = df['SMA_50'].iloc[-1] < df['SMA_50'].iloc[-21]
-        
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
+        # The Exact MIO Criteria
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        # Strict 20-day original formula
         c3 = (df['SMA_20'].iloc[-20:] >= df['SMA_50'].iloc[-20:]).all() 
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
@@ -163,10 +141,10 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
     except Exception:
-        pass
+        pass # Silently skip broken stocks to keep the scanner running
     
-    # Respect API rate limits
-    time.sleep(0.1) 
+    # Mandatory API Throttle: Prevents Dhan from blocking your IP
+    time.sleep(0.15) 
     return None
 
 # --- Dashboard Controls ---
@@ -190,16 +168,16 @@ if st.button("🚀 Run Market Scan", type="primary"):
         sec_map = get_dhan_security_map()
         
         if not tickers or not sec_map:
-            st.error("Failed to pull market or security data.")
+            st.error("Failed to pull required data. Check the error messages above.")
         else:
-            st.info(f"Crunching {len(tickers)} stocks via Dhan API... Please wait.")
+            st.info(f"Crunching {len(tickers)} stocks via Dhan API... This will take a few minutes due to API safety limits.")
             
             passed_results = []
             progress_bar = st.progress(0)
             
             check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, sec_map=sec_map, dhan_client=dhan)
             
-            # Reduced max_workers to 5 to respect broker API rate limits
+            # Locked at 5 workers to strictly respect Dhan API rate limits
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 results = executor.map(check_func, tickers)
                 for i, result in enumerate(results):
@@ -219,7 +197,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
 
                 st.divider()
 
-                # --- 2. TRADINGVIEW INTERACTIVE CHART VIEW ---
+                # --- 2. TRADINGVIEW NATIVE CHARTS ---
                 st.subheader(f"📊 Chart View (Data up to {target_date.strftime('%Y-%m-%d')})")
                 for res in passed_results:
                     st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
@@ -263,11 +241,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                         {
                             "type": 'Line',
                             "data": sma20,
-                            "options": {
-                                "color": '#ffa726',
-                                "lineWidth": 2,
-                                "title": '20 DMA'
-                            }
+                            "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
                         },
                         {
                             "type": 'Histogram',
