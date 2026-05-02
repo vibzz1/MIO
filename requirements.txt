@@ -1,6 +1,6 @@
 streamlit
-yfinance
 pandas
 pandas-ta
 nselib
 plotly
+dhanhq
