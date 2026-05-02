@@ -45,10 +45,8 @@ def get_all_nse():
 def check_stock(ticker, ind_map, effective_date):
     try:
         start_date = effective_date - datetime.timedelta(days=250)
-        # yfinance end date is exclusive, so we explicitly add 1 day to ensure the target date is captured
         end_date = effective_date + datetime.timedelta(days=1) 
         
-        # This natively handles all split/dividend adjustments to keep MAs perfectly smooth
         ticker_obj = yf.Ticker(f"{ticker}.NS")
         df = ticker_obj.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
         
@@ -57,11 +55,9 @@ def check_stock(ticker, ind_map, effective_date):
             
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         
-        # Clean timezone issues
         df.index = df.index.tz_localize(None) 
         df.sort_index(inplace=True) 
         
-        # Rigorous Data Sanitizer
         df = df[df['Volume'] > 0]
         
         if len(df) < 70: return None
@@ -111,7 +107,7 @@ with col1:
 with col2:
     raw_target_date = st.date_input("📅 Target Scan Date", value=datetime.date.today())
 
-# AUTO-DATE SNAPPER: Intelligently forces weekend requests back to Friday
+# AUTO-DATE SNAPPER
 effective_target = pd.to_datetime(raw_target_date)
 while effective_target.weekday() >= 5: 
     effective_target -= datetime.timedelta(days=1)
@@ -135,7 +131,6 @@ if st.button("🚀 Run Market Scan", type="primary"):
         
         check_func = partial(check_stock, ind_map=ind_map, effective_date=effective_target)
         
-        # Max workers massively increased because we are free from API rate limits
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
             results = executor.map(check_func, tickers)
             for i, result in enumerate(results):
@@ -177,48 +172,44 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 volume = volume[['time', 'Volume', 'color']].rename(columns={'Volume': 'value'}).to_dict('records')
 
                 chartOptions = {
-                        "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
-                        "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
-                        "crosshair": { "mode": 1 },
-                        # CRITICAL FIX 1: Tell price candles to stop 20% above the floor
-                        "rightPriceScale": { 
-                            "borderColor": '#485c7b',
-                            "scaleMargins": { "top": 0.05, "bottom": 0.2 } 
-                        },
-                        "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
-                        "height": 500
-                    }
+                    "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
+                    "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
+                    "crosshair": { "mode": 1 },
+                    "rightPriceScale": { 
+                        "borderColor": '#485c7b',
+                        "scaleMargins": { "top": 0.05, "bottom": 0.2 } 
+                    },
+                    "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
+                    "height": 500
+                }
 
-                    series_list = [
-                        {
-                            "type": 'Candlestick',
-                            "data": candles,
-                            "options": {
-                                "upColor": '#00b060', "downColor": '#ff333a', 
-                                "borderVisible": False, 
-                                "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
-                            }
+                series_list = [
+                    {
+                        "type": 'Candlestick',
+                        "data": candles,
+                        "options": {
+                            "upColor": '#00b060', "downColor": '#ff333a', 
+                            "borderVisible": False, 
+                            "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
+                        }
+                    },
+                    {
+                        "type": 'Line',
+                        "data": sma20,
+                        "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
+                    },
+                    {
+                        "type": 'Histogram',
+                        "data": volume,
+                        "options": {
+                            "priceFormat": {"type": 'volume'},
+                            "priceScaleId": "" 
                         },
-                        {
-                            "type": 'Line',
-                            "data": sma20,
-                            "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
-                        },
-                        {
-                            "type": 'Histogram',
-                            "data": volume,
-                            "options": {
-                                "priceFormat": {"type": 'volume'},
-                                "priceScaleId": "" 
-                            },
-                            # CRITICAL FIX 2: priceScale moved OUTSIDE of 'options' to trap volume in bottom 20%
-                            "priceScale": {
-                                "scaleMargins": { "top": 0.8, "bottom": 0 }
-                            }
+                        "priceScale": {
+                            "scaleMargins": { "top": 0.8, "bottom": 0 }
                         }
                     }
-            ]
-    
+                ]
 
                 renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
                 st.markdown("---")
