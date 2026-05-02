@@ -7,9 +7,7 @@ from streamlit_lightweight_charts import renderLightweightCharts
 from nselib import capital_market
 from functools import partial
 import datetime
-from dhanhq import dhanhq, DhanContext
 import requests
-import io
 import time
 
 warnings.filterwarnings("ignore")
@@ -17,35 +15,17 @@ warnings.filterwarnings("ignore")
 # --- UI Setup ---
 st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
-st.markdown("Automated scan for high-probability momentum setups using institutional Dhan API data.")
+st.markdown("Automated scan for high-probability momentum setups using a Direct Native Dhan API Tunnel.")
 
 # --- API Credentials ---
 st.sidebar.header("🔑 Dhan API Settings")
 client_id = st.sidebar.text_input("Client ID", type="password")
 access_token = st.sidebar.text_input("Access Token", type="password")
 
-if client_id and access_token:
-    # UPDATED: Dhan's newest library requires DhanContext to log in
-    dhan_context = DhanContext(client_id, access_token)
-    dhan = dhanhq(dhan_context)
-else:
+if not (client_id and access_token):
     st.sidebar.warning("Please enter your Dhan API credentials to run the scan.")
 
-# --- Data Fetching & Security Mapping ---
-@st.cache_data(ttl=86400) 
-def get_dhan_security_map():
-    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status() 
-        df = pd.read_csv(io.StringIO(response.text), low_memory=False)
-        nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')]
-        return dict(zip(nse_eq['SM_SYMBOL_NAME'], nse_eq['SEM_SMST_SECURITY_ID']))
-    except Exception as e:
-        st.error(f"🚨 Dhan Security Master Error: {e}")
-        return {}
-
+# --- Data Fetching (CSV mapping completely removed for speed) ---
 @st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
@@ -72,43 +52,67 @@ def get_all_nse():
         st.error(f"🚨 NSE Server Error: {e}")
         return [], {}
 
-# --- The Engine ---
-def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
-    sec_id = sec_map.get(ticker)
-    if not sec_id: return None
-
+# --- The Engine (Direct REST API Tunnel) ---
+def check_stock(ticker, ind_map, target_date, cid, token):
     try:
         target_dt = pd.to_datetime(target_date)
         from_date = target_dt - datetime.timedelta(days=250)
         
-        req = dhan_client.historical_daily_data(
-            security_id=str(sec_id),
-            exchange_segment='NSE_EQ',
-            instrument_type='EQUITY',
-            expiry_code=0,
-            from_date=from_date.strftime('%Y-%m-%d'),
-            to_date=target_dt.strftime('%Y-%m-%d')
-        )
+        url = "https://api.dhan.co/charts/historical"
+        headers = {
+            "access-token": token,
+            "client-id": cid,
+            "Content-Type": "application/json"
+        }
+        # Direct payload sending the exact text symbol, bypassing the library bug
+        payload = {
+            "symbol": ticker,
+            "exchangeSegment": "NSE_EQ",
+            "instrument": "EQUITY",
+            "expiryCode": 0,
+            "fromDate": from_date.strftime('%Y-%m-%d'),
+            "toDate": target_dt.strftime('%Y-%m-%d')
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
+        # Rigorous Error Catching for exact API responses
+        if response.status_code == 429:
+            return {"error": f"Rate Limit (429) hit on {ticker}. Dhan is throttling us."}
+        elif response.status_code != 200:
+            return {"error": f"HTTP {response.status_code} on {ticker}: {response.text}"}
+            
+        req = response.json()
         
         if req.get('status') != 'success' or not req.get('data') or len(req['data'].get('close', [])) == 0:
-            return {"error": f"Dhan API rejected {ticker} (Data empty or rate limit)"}
+            return {"error": f"Dhan API returned empty data for {ticker}."}
             
         data = req['data']
-        time_keys = data.get('timestamp') or data.get('start_Time')
+        time_keys = data.get('start_Time') or data.get('timestamp')
         
+        if not time_keys:
+            return {"error": f"Missing timestamp data for {ticker}"}
+        
+        # Foolproof epoch/string date parser
         try:
-            dt_index = pd.to_datetime(time_keys, unit='s')
+            if isinstance(time_keys[0], str) and "-" in time_keys[0]:
+                dt_index = pd.to_datetime(time_keys)
+            elif time_keys[0] > 1e11:
+                dt_index = pd.to_datetime(time_keys, unit='ms')
+            else:
+                dt_index = pd.to_datetime(time_keys, unit='s')
         except:
             dt_index = pd.to_datetime(time_keys)
         
         df = pd.DataFrame({
-            'Open': pd.to_numeric(data['open']),
-            'High': pd.to_numeric(data['high']),
-            'Low': pd.to_numeric(data['low']),
-            'Close': pd.to_numeric(data['close']),
-            'Volume': pd.to_numeric(data['volume'])
+            'Open': data['open'],
+            'High': data['high'],
+            'Low': data['low'],
+            'Close': data['close'],
+            'Volume': data['volume']
         }, index=dt_index)
         
+        df = df.apply(pd.to_numeric)
         df.sort_index(inplace=True) 
         
         if len(df) < 70: return None
@@ -130,7 +134,6 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
 
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        # Reverted back to the relaxed 5-day rule 
         c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all() 
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
@@ -145,11 +148,13 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
     except Exception as e:
-        # We no longer "pass" errors. We log them so we can see what breaks.
-        return {"error": f"Code crash on {ticker}: {str(e)}"}
+        return {"error": f"Crash on {ticker}: {str(e)}"}
     
-    # 🚨 STRICT THROTTLE: Keeps us under 5 requests per second to avoid API bans
-    time.sleep(0.5) 
+    finally:
+        # 🚨 STRICT THROTTLE: Placed in a 'finally' block so it mathematically 
+        # guarantees a 0.5s delay even if the code crashes, preventing Dhan IP bans.
+        time.sleep(0.5) 
+        
     return None
 
 # --- Dashboard Controls ---
@@ -170,20 +175,17 @@ if st.button("🚀 Run Market Scan", type="primary"):
         else:
             tickers, ind_map = get_all_nse()
         
-        sec_map = get_dhan_security_map()
-        
-        if not tickers or not sec_map:
-            st.error("Failed to pull required data. Check the error messages above.")
+        if not tickers:
+            st.error("Failed to pull market data from NSE.")
         else:
-            st.info(f"Crunching stocks via Dhan API... Processing 2 stocks per second to avoid rate limits.")
+            st.info(f"Crunching stocks via Native API... Processing safely to respect institutional limits.")
             
             passed_results = []
             api_errors = []
             progress_bar = st.progress(0)
             
-            check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, sec_map=sec_map, dhan_client=dhan)
+            check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, cid=client_id, token=access_token)
             
-            # LOCKED to 2 workers to ensure we stay under the API limit
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 results = executor.map(check_func, tickers)
                 for i, result in enumerate(results):
@@ -198,13 +200,12 @@ if st.button("🚀 Run Market Scan", type="primary"):
 
             if api_errors:
                 with st.expander("⚠️ View API Errors (Rate limits or missing data)"):
-                    for err in api_errors[:20]: # Show top 20 errors so it doesn't crash the UI
+                    for err in api_errors[:20]: 
                         st.write(err)
 
             if passed_results:
                 st.success(f"🔥 Found {len(passed_results)} setups on {target_date.strftime('%B %d, %Y')}!")
                 
-                # --- 1. LIST VIEW ---
                 st.subheader("📋 List View")
                 df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
                 df_results.index = df_results.index + 1
@@ -212,7 +213,6 @@ if st.button("🚀 Run Market Scan", type="primary"):
 
                 st.divider()
 
-                # --- 2. TRADINGVIEW NATIVE CHARTS ---
                 st.subheader(f"📊 Chart View (Data up to {target_date.strftime('%Y-%m-%d')})")
                 for res in passed_results:
                     st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
