@@ -3,4 +3,4 @@ pandas
 pandas-ta
 nselib
 streamlit-lightweight-charts
-requests
+yfinance
