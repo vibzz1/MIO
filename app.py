@@ -1,22 +1,49 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import concurrent.futures
 import warnings
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from streamlit_lightweight_charts import renderLightweightCharts
 from nselib import capital_market
 from functools import partial
+import datetime
+from dhanhq import dhanhq
+import requests
+import io
+import time
 
 warnings.filterwarnings("ignore")
 
 # --- UI Setup ---
 st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
-st.markdown("Automated scan for high-probability momentum setups.")
+st.markdown("Automated scan for high-probability momentum setups using Dhan API.")
 
-# --- Data Fetching & Industry Mapping ---
+# --- API Credentials (Input via Streamlit Sidebar) ---
+st.sidebar.header("🔑 Dhan API Settings")
+client_id = st.sidebar.text_input("Client ID", type="password")
+access_token = st.sidebar.text_input("Access Token", type="password")
+
+if client_id and access_token:
+    dhan = dhanhq(client_id, access_token)
+else:
+    st.sidebar.warning("Please enter your Dhan API credentials to run the scan.")
+
+# --- Data Fetching & Security Mapping ---
+@st.cache_data(ttl=86400) # Cache the security list for 24 hours
+def get_dhan_security_map():
+    # Dhan provides a daily CSV of all trading symbols and their internal IDs
+    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    try:
+        response = requests.get(url)
+        df = pd.read_csv(io.StringIO(response.text))
+        # Filter for NSE Equity only
+        nse_eq = df[(df['EXCH_ID'] == 'NSE') & (df['INSTRUMENT'] == 'EQUITY')]
+        # Create a dictionary mapping Ticker -> Security ID
+        return dict(zip(nse_eq['SEM_CUSTOM_SYMBOL'], nse_eq['SEM_SMST_SECURITY_ID']))
+    except:
+        return {}
+
 @st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
@@ -25,11 +52,8 @@ def get_nifty_500():
         mid150 = capital_market.niftymidcap150_equity_list()
         sml250 = capital_market.niftysmallcap250_equity_list()
         df = pd.concat([n50, nn50, mid150, sml250], ignore_index=True)
-        
         tickers = list(set(df['Symbol'].tolist()))
-        # Build an official NSE industry dictionary so we don't rely on Yahoo Finance
         ind_map = dict(zip(df['Symbol'], df['Industry']))
-        
         return tickers, ind_map
     except: return [], {}
 
@@ -40,22 +64,44 @@ def get_all_nse():
         df.columns = df.columns.str.upper() 
         raw = df['SYMBOL'].tolist()
         tickers = list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
-        
-        # Borrow the industry map from the top 500 as a baseline 
         _, ind_map = get_nifty_500()
-        
         return tickers, ind_map
     except: return [], {}
 
-# --- Screener Logic ---
-def check_stock(ticker, ind_map):
-    symbol = f"{ticker}.NS"
-    try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period="1y")
-        if len(df) < 70: return None 
+# --- The Engine (Powered by Dhan) ---
+def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
+    sec_id = sec_map.get(ticker)
+    if not sec_id: return None
 
-        df.dropna(inplace=True)
+    try:
+        # Dhan Historical Data API Call
+        # We fetch 250 days of data ending on the target date
+        target_dt = pd.to_datetime(target_date)
+        from_date = target_dt - datetime.timedelta(days=250)
+        
+        req = dhan_client.get_historical_prices(
+            symbol=ticker,
+            exchange_segment='NSE_EQ',
+            instrument_type='EQUITY',
+            expiry_code=0,
+            from_date=from_date.strftime('%Y-%m-%d'),
+            to_date=target_dt.strftime('%Y-%m-%d')
+        )
+        
+        if req.get('status') != 'success' or not req.get('data'):
+            return None
+            
+        data = req['data']
+        df = pd.DataFrame({
+            'Open': data['open'],
+            'High': data['high'],
+            'Low': data['low'],
+            'Close': data['close'],
+            'Volume': data['volume']
+        }, index=pd.to_datetime(data['start_Time']))
+        
+        if len(df) < 70: return None
+
         df['SMA_10'] = ta.sma(df['Close'], length=10)
         df['SMA_20'] = ta.sma(df['Close'], length=20)
         df['SMA_50'] = ta.sma(df['Close'], length=50)
@@ -68,12 +114,14 @@ def check_stock(ticker, ind_map):
         if len(df) < 22: return None
 
         sma50_trend_dn_20 = df['SMA_50'].iloc[-1] < df['SMA_50'].iloc[-21]
+        
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all()
+        # Strict 20-day original formula
+        c3 = (df['SMA_20'].iloc[-20:] >= df['SMA_50'].iloc[-20:]).all() 
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
@@ -83,92 +131,128 @@ def check_stock(ticker, ind_map):
         c10 = latest['Close'] > (latest['Low'] + ((latest['High'] - latest['Low']) * 0.4))
 
         if all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]):
-            
-            # Check our local NSE map first to bypass YF rate limits
-            industry = ind_map.get(ticker)
-            
-            # If it's an obscure micro-cap not in the 500, fallback to YF
-            if not industry or pd.isna(industry):
-                try: industry = stock.info.get('industry', 'N/A')
-                except: industry = 'N/A'
-                
+            industry = ind_map.get(ticker, 'N/A')
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
-    except: pass
+    except Exception:
+        pass
+    
+    # Respect API rate limits
+    time.sleep(0.1) 
     return None
 
 # --- Dashboard Controls ---
-scan_mode = st.radio("Select Market Universe:", ["Nifty 500 (Fast)", "All NSE Stocks (~2,200 Stocks, Slower)"])
+col1, col2 = st.columns(2)
+
+with col1:
+    scan_mode = st.radio("Select Market Universe:", ["Nifty 500 (Fast)", "All NSE Stocks (~2,200 Stocks, Slower)"])
+
+with col2:
+    target_date = st.date_input("📅 Target Scan Date (HIST Function)", value=datetime.date.today())
 
 if st.button("🚀 Run Market Scan", type="primary"):
-    
-    if "Nifty 500" in scan_mode:
-        tickers, ind_map = get_nifty_500()
+    if not client_id or not access_token:
+        st.error("Please enter your Dhan API credentials in the sidebar first.")
     else:
-        tickers, ind_map = get_all_nse()
-    
-    if not tickers:
-        st.error("Failed to pull market data. The NSE server might be busy.")
-    else:
-        st.info(f"Crunching {len(tickers)} stocks... Please wait 60-90 seconds.")
-        
-        passed_results = []
-        progress_bar = st.progress(0)
-        
-        # Package the check_stock function with our industry map so threads can use it safely
-        check_func = partial(check_stock, ind_map=ind_map)
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-            results = executor.map(check_func, tickers)
-            for i, result in enumerate(results):
-                if result: passed_results.append(result)
-                progress_bar.progress(min((i + 1) / len(tickers), 1.0))
-                
-        progress_bar.empty()
-
-        if passed_results:
-            st.success(f"🔥 Found {len(passed_results)} setups!")
-            
-            # --- 1. LIST VIEW ---
-            st.subheader("📋 List View")
-            df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
-            df_results.index = df_results.index + 1
-            st.dataframe(df_results, use_container_width=True)
-
-            st.divider()
-
-            # --- 2. INTERACTIVE CHART VIEW ---
-            st.subheader("📊 Interactive Chart View (Scroll to Zoom, Click & Drag to Pan)")
-            for res in passed_results:
-                st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
-                df_chart = res['chart_data']
-                
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                    vertical_spacing=0.03, row_heights=[0.7, 0.3])
-
-                # 1. Vibrant, Solid Candlesticks
-                fig.add_trace(go.Candlestick(x=df_chart.index,
-                                open=df_chart['Open'], high=df_chart['High'],
-                                low=df_chart['Low'], close=df_chart['Close'],
-                                name='Price',
-                                increasing_line_color='#00b060', increasing_fillcolor='#00b060',
-                                decreasing_line_color='#ff333a', decreasing_fillcolor='#ff333a'), 
-                                row=1, col=1)
-
-                # 2. Add 20 DMA (Orange Line)
-                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA_20'], 
-                                         line=dict(color='orange', width=1.5), 
-                                         name='20 DMA'), row=1, col=1)
-
-                # 3. Volume Bar Chart
-                colors = ['#00b060' if row['Close'] >= row['Open'] else '#ff333a' for index, row in df_chart.iterrows()]
-                fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['Volume'], 
-                                     marker_color=colors, name='Volume'), row=2, col=1)
-
-                fig.update_layout(height=600, showlegend=False, margin=dict(l=20, r=20, t=20, b=20))
-                fig.update_xaxes(rangeslider_visible=False)
-                
-                st.plotly_chart(fig, use_container_width=True)
-                st.markdown("---")
+        if "Nifty 500" in scan_mode:
+            tickers, ind_map = get_nifty_500()
         else:
-            st.warning("No stocks matched the criteria today.")
+            tickers, ind_map = get_all_nse()
+        
+        sec_map = get_dhan_security_map()
+        
+        if not tickers or not sec_map:
+            st.error("Failed to pull market or security data.")
+        else:
+            st.info(f"Crunching {len(tickers)} stocks via Dhan API... Please wait.")
+            
+            passed_results = []
+            progress_bar = st.progress(0)
+            
+            check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, sec_map=sec_map, dhan_client=dhan)
+            
+            # Reduced max_workers to 5 to respect broker API rate limits
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                results = executor.map(check_func, tickers)
+                for i, result in enumerate(results):
+                    if result: passed_results.append(result)
+                    progress_bar.progress(min((i + 1) / len(tickers), 1.0))
+                    
+            progress_bar.empty()
+
+            if passed_results:
+                st.success(f"🔥 Found {len(passed_results)} setups!")
+                
+                # --- 1. LIST VIEW ---
+                st.subheader("📋 List View")
+                df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
+                df_results.index = df_results.index + 1
+                st.dataframe(df_results, use_container_width=True)
+
+                st.divider()
+
+                # --- 2. TRADINGVIEW INTERACTIVE CHART VIEW ---
+                st.subheader(f"📊 Chart View (Data up to {target_date.strftime('%Y-%m-%d')})")
+                for res in passed_results:
+                    st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
+                    
+                    df_plot = res['chart_data'].tail(150).copy()
+                    df_plot['time'] = df_plot.index.strftime('%Y-%m-%d')
+                    
+                    candles = df_plot[['time', 'Open', 'High', 'Low', 'Close']].rename(
+                        columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}
+                    ).to_dict('records')
+                    
+                    sma20 = df_plot[['time', 'SMA_20']].dropna().rename(
+                        columns={'SMA_20': 'value'}
+                    ).to_dict('records')
+
+                    volume = df_plot[['time', 'Volume', 'Close', 'Open']].copy()
+                    volume['color'] = volume.apply(
+                        lambda row: 'rgba(0, 176, 96, 0.5)' if row['Close'] >= row['Open'] else 'rgba(255, 51, 58, 0.5)', axis=1
+                    )
+                    volume = volume[['time', 'Volume', 'color']].rename(columns={'Volume': 'value'}).to_dict('records')
+
+                    chartOptions = {
+                        "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
+                        "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
+                        "crosshair": { "mode": 1 },
+                        "priceScale": { "borderColor": '#485c7b' },
+                        "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
+                        "height": 500
+                    }
+
+                    series_list = [
+                        {
+                            "type": 'Candlestick',
+                            "data": candles,
+                            "options": {
+                                "upColor": '#00b060', "downColor": '#ff333a', 
+                                "borderVisible": False, 
+                                "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
+                            }
+                        },
+                        {
+                            "type": 'Line',
+                            "data": sma20,
+                            "options": {
+                                "color": '#ffa726',
+                                "lineWidth": 2,
+                                "title": '20 DMA'
+                            }
+                        },
+                        {
+                            "type": 'Histogram',
+                            "data": volume,
+                            "options": {
+                                "priceFormat": {"type": 'volume'},
+                                "priceScaleId": "",
+                                "scaleMargins": {"top": 0.8, "bottom": 0}
+                            }
+                        }
+                    ]
+
+                    renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
+                    st.markdown("---")
+            else:
+                st.warning(f"No stocks matched the criteria on {target_date.strftime('%B %d, %Y')}.")
