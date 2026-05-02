@@ -214,6 +214,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                                 }
                             }
                         }
+                  ] 
     
 
                 renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
