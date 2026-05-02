@@ -177,44 +177,47 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 volume = volume[['time', 'Volume', 'color']].rename(columns={'Volume': 'value'}).to_dict('records')
 
                 chartOptions = {
-                    "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
-                    "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
-                    "crosshair": { "mode": 1 },
-                    "priceScale": { "borderColor": '#485c7b' },
-                    "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
-                    "height": 500
-                }
+                        "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
+                        "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
+                        "crosshair": { "mode": 1 },
+                        # CRITICAL FIX 1: Tell price candles to stop 20% above the floor
+                        "rightPriceScale": { 
+                            "borderColor": '#485c7b',
+                            "scaleMargins": { "top": 0.05, "bottom": 0.2 } 
+                        },
+                        "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
+                        "height": 500
+                    }
 
-                series_list = [
-                    {
-                        "type": 'Candlestick',
-                        "data": candles,
-                        "options": {
-                            "upColor": '#00b060', "downColor": '#ff333a', 
-                            "borderVisible": False, 
-                            "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
-                        }
-                    },
-                    {
-                        "type": 'Line',
-                        "data": sma20,
-                        "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
-                    },
-                  {
+                    series_list = [
+                        {
+                            "type": 'Candlestick',
+                            "data": candles,
+                            "options": {
+                                "upColor": '#00b060', "downColor": '#ff333a', 
+                                "borderVisible": False, 
+                                "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
+                            }
+                        },
+                        {
+                            "type": 'Line',
+                            "data": sma20,
+                            "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
+                        },
+                        {
                             "type": 'Histogram',
                             "data": volume,
                             "options": {
                                 "priceFormat": {"type": 'volume'},
-                                "priceScaleId": "", 
-                                "priceScale": {  # <--- We must nest the margins inside this specific dictionary
-                                    "scaleMargins": {
-                                        "top": 0.8, # This forces volume to stay in the bottom 20%
-                                        "bottom": 0
-                                    }
-                                }
+                                "priceScaleId": "" 
+                            },
+                            # CRITICAL FIX 2: priceScale moved OUTSIDE of 'options' to trap volume in bottom 20%
+                            "priceScale": {
+                                "scaleMargins": { "top": 0.8, "bottom": 0 }
                             }
                         }
-                  ] 
+                    }
+                ] 
     
 
                 renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
