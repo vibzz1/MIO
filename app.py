@@ -162,7 +162,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 ).to_dict('records')
                 
                 sma20 = df_plot[['time', 'SMA_20']].dropna().rename(
-                    columns={'': 'value'}
+                    columns={'SMA_20': 'value'}
                     
                 ).to_dict('records')
 
@@ -197,7 +197,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                     {
                         "type": 'Line',
                         "data": sma20,
-                        "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
+                        "options": {"color": '#ffa726', "lineWidth": 2}
                     },
                     {
                         "type": 'Histogram',
