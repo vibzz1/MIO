@@ -2,5 +2,5 @@ streamlit
 pandas
 pandas-ta
 nselib
-plotly
 dhanhq
+streamlit-lightweight-charts
