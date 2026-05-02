@@ -38,8 +38,10 @@ def get_dhan_security_map():
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status() 
         df = pd.read_csv(io.StringIO(response.text), low_memory=False)
-        nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')]
-        # Returns a dictionary like {'RELIANCE': '2885'}
+        nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')].copy()
+        
+        # RIGOROUS FIX: Forces IDs to be clean strings to prevent Pandas float-casting bugs
+        nse_eq['SEM_SMST_SECURITY_ID'] = pd.to_numeric(nse_eq['SEM_SMST_SECURITY_ID'], errors='coerce').fillna(0).astype(int).astype(str)
         return dict(zip(nse_eq['SM_SYMBOL_NAME'], nse_eq['SEM_SMST_SECURITY_ID']))
     except Exception as e:
         st.error(f"🚨 Dhan Security Master Error: {e}")
@@ -55,7 +57,6 @@ def get_nifty_500():
         df = pd.concat([n50, nn50, mid150, sml250], ignore_index=True)
         return list(set(df['Symbol'].tolist())), dict(zip(df['Symbol'], df['Industry']))
     except Exception as e:
-        st.error(f"🚨 NSE Server Error: {e}")
         return [], {}
 
 @st.cache_data(ttl=3600)
@@ -68,17 +69,16 @@ def get_all_nse():
         _, ind_map = get_nifty_500() 
         return tickers, ind_map
     except Exception as e:
-        st.error(f"🚨 NSE Server Error: {e}")
         return [], {}
 
 # --- The Engine (Direct REST API Tunnel) ---
-def check_stock(ticker, ind_map, target_date, cid, token, sec_map):
+def check_stock(ticker, ind_map, effective_date, cid, token, sec_map):
     sec_id = sec_map.get(ticker)
-    if not sec_id: return None
+    if not sec_id or sec_id == "0": return None
 
     try:
-        target_dt = pd.to_datetime(target_date)
-        from_date = target_dt - datetime.timedelta(days=250)
+        # Expanding lookback to 365 days to guarantee we get enough valid trading days
+        from_date = effective_date - datetime.timedelta(days=365)
         
         url = "https://api.dhan.co/charts/historical"
         headers = {
@@ -87,22 +87,20 @@ def check_stock(ticker, ind_map, target_date, cid, token, sec_map):
             "Content-Type": "application/json"
         }
         
-        # CRITICAL FIX: The API demands the numerical 'securityId', not the text symbol
         payload = {
             "securityId": str(sec_id),
             "exchangeSegment": "NSE_EQ",
             "instrument": "EQUITY",
             "expiryCode": 0,
             "fromDate": from_date.strftime('%Y-%m-%d'),
-            "toDate": target_dt.strftime('%Y-%m-%d')
+            "toDate": effective_date.strftime('%Y-%m-%d')
         }
         
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         
         if response.status_code == 429:
-            return {"error": f"Rate Limit (429) hit on {ticker}. Dhan is throttling us."}
+            return {"error": f"Rate Limit hit on {ticker}. Dhan is throttling us."}
             
-        # SAFE PARSING: Prevents the "Expecting value" crash if Dhan sends a blank page
         try:
             req = response.json()
         except ValueError:
@@ -138,6 +136,9 @@ def check_stock(ticker, ind_map, target_date, cid, token, sec_map):
         df = df.apply(pd.to_numeric)
         df.sort_index(inplace=True) 
         
+        # RIGOROUS DATA SANITIZER: Deletes any fake holiday/weekend candles with 0 volume
+        df = df[df['Volume'] > 0]
+        
         if len(df) < 70: return None
 
         df['SMA_10'] = ta.sma(df['Close'], length=10)
@@ -152,6 +153,8 @@ def check_stock(ticker, ind_map, target_date, cid, token, sec_map):
         if len(df) < 22: return None
 
         sma50_trend_dn_20 = df['SMA_50'].iloc[-1] < df['SMA_50'].iloc[-21]
+        
+        # Now guaranteed to be the actual last trading day
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
@@ -185,7 +188,12 @@ with col1:
     scan_mode = st.radio("Select Market Universe:", ["Nifty 500 (Fast)", "All NSE Stocks (~2,200 Stocks, Slower)"])
 
 with col2:
-    target_date = st.date_input("📅 Target Scan Date (HIST Function)", value=datetime.date.today())
+    raw_target_date = st.date_input("📅 Target Scan Date", value=datetime.date.today())
+
+# AUTO-DATE SNAPPER: Hijacks weekend dates and forces them backward to Friday
+effective_target = pd.to_datetime(raw_target_date)
+while effective_target.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+    effective_target -= datetime.timedelta(days=1)
 
 if st.button("🚀 Run Market Scan", type="primary"):
     if not client_id or not access_token:
@@ -201,13 +209,16 @@ if st.button("🚀 Run Market Scan", type="primary"):
         if not tickers or not sec_map:
             st.error("Failed to pull market data or security map.")
         else:
+            if raw_target_date != effective_target.date():
+                st.warning(f"Weekend detected. Auto-snapping scan date back to last trading day: **{effective_target.strftime('%A, %B %d, %Y')}**")
+                
             st.info(f"Crunching stocks via Native API... Processing safely to respect institutional limits.")
             
             passed_results = []
             api_errors = []
             progress_bar = st.progress(0)
             
-            check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, cid=client_id, token=access_token, sec_map=sec_map)
+            check_func = partial(check_stock, ind_map=ind_map, effective_date=effective_target, cid=client_id, token=access_token, sec_map=sec_map)
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 results = executor.map(check_func, tickers)
@@ -227,7 +238,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                         st.write(err)
 
             if passed_results:
-                st.success(f"🔥 Found {len(passed_results)} setups on {target_date.strftime('%B %d, %Y')}!")
+                st.success(f"🔥 Found {len(passed_results)} setups for {effective_target.strftime('%B %d, %Y')}!")
                 
                 st.subheader("📋 List View")
                 df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
@@ -236,7 +247,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
 
                 st.divider()
 
-                st.subheader(f"📊 Chart View (Data up to {target_date.strftime('%Y-%m-%d')})")
+                st.subheader(f"📊 Chart View (Data up to {effective_target.strftime('%Y-%m-%d')})")
                 for res in passed_results:
                     st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
                     
@@ -295,4 +306,4 @@ if st.button("🚀 Run Market Scan", type="primary"):
                     renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
                     st.markdown("---")
             else:
-                st.warning(f"No stocks matched the criteria on {target_date.strftime('%B %d, %Y')}.")
+                st.warning(f"No stocks matched the criteria on {effective_target.strftime('%B %d, %Y')}.")
