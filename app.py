@@ -185,7 +185,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                     "height": 500
                 }
 
-                series_list = [
+                series_list = []
                     {
                         "type": 'Candlestick',
                         "data": candles,
