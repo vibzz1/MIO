@@ -44,7 +44,7 @@ def get_all_nse():
 # --- The Engine (Adjusted yfinance Data) ---
 def check_stock(ticker, ind_map, effective_date):
     try:
-        start_date = effective_date - datetime.timedelta(days=250)
+        start_date = effective_date - datetime.timedelta(days=450)
         end_date = effective_date + datetime.timedelta(days=1) 
         
         ticker_obj = yf.Ticker(f"{ticker}.NS")
