@@ -8,6 +8,7 @@ from nselib import capital_market
 from functools import partial
 import datetime
 import requests
+import io
 import time
 
 warnings.filterwarnings("ignore")
@@ -19,13 +20,31 @@ st.markdown("Automated scan for high-probability momentum setups using a Direct 
 
 # --- API Credentials ---
 st.sidebar.header("🔑 Dhan API Settings")
-client_id = st.sidebar.text_input("Client ID", type="password")
-access_token = st.sidebar.text_input("Access Token", type="password")
+raw_cid = st.sidebar.text_input("Client ID", type="password")
+raw_token = st.sidebar.text_input("Access Token", type="password")
+
+client_id = raw_cid.encode('ascii', 'ignore').decode().strip() if raw_cid else ""
+access_token = raw_token.encode('ascii', 'ignore').decode().strip() if raw_token else ""
 
 if not (client_id and access_token):
     st.sidebar.warning("Please enter your Dhan API credentials to run the scan.")
 
-# --- Data Fetching (CSV mapping completely removed for speed) ---
+# --- Data Fetching & Security Mapping ---
+@st.cache_data(ttl=86400) 
+def get_dhan_security_map():
+    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status() 
+        df = pd.read_csv(io.StringIO(response.text), low_memory=False)
+        nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')]
+        # Returns a dictionary like {'RELIANCE': '2885'}
+        return dict(zip(nse_eq['SM_SYMBOL_NAME'], nse_eq['SEM_SMST_SECURITY_ID']))
+    except Exception as e:
+        st.error(f"🚨 Dhan Security Master Error: {e}")
+        return {}
+
 @st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
@@ -53,7 +72,10 @@ def get_all_nse():
         return [], {}
 
 # --- The Engine (Direct REST API Tunnel) ---
-def check_stock(ticker, ind_map, target_date, cid, token):
+def check_stock(ticker, ind_map, target_date, cid, token, sec_map):
+    sec_id = sec_map.get(ticker)
+    if not sec_id: return None
+
     try:
         target_dt = pd.to_datetime(target_date)
         from_date = target_dt - datetime.timedelta(days=250)
@@ -64,9 +86,10 @@ def check_stock(ticker, ind_map, target_date, cid, token):
             "client-id": cid,
             "Content-Type": "application/json"
         }
-        # Direct payload sending the exact text symbol, bypassing the library bug
+        
+        # CRITICAL FIX: The API demands the numerical 'securityId', not the text symbol
         payload = {
-            "symbol": ticker,
+            "securityId": str(sec_id),
             "exchangeSegment": "NSE_EQ",
             "instrument": "EQUITY",
             "expiryCode": 0,
@@ -76,13 +99,14 @@ def check_stock(ticker, ind_map, target_date, cid, token):
         
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         
-        # Rigorous Error Catching for exact API responses
         if response.status_code == 429:
             return {"error": f"Rate Limit (429) hit on {ticker}. Dhan is throttling us."}
-        elif response.status_code != 200:
-            return {"error": f"HTTP {response.status_code} on {ticker}: {response.text}"}
             
-        req = response.json()
+        # SAFE PARSING: Prevents the "Expecting value" crash if Dhan sends a blank page
+        try:
+            req = response.json()
+        except ValueError:
+            return {"error": f"API returned blank data for {ticker}. Status: {response.status_code}"}
         
         if req.get('status') != 'success' or not req.get('data') or len(req['data'].get('close', [])) == 0:
             return {"error": f"Dhan API returned empty data for {ticker}."}
@@ -93,7 +117,6 @@ def check_stock(ticker, ind_map, target_date, cid, token):
         if not time_keys:
             return {"error": f"Missing timestamp data for {ticker}"}
         
-        # Foolproof epoch/string date parser
         try:
             if isinstance(time_keys[0], str) and "-" in time_keys[0]:
                 dt_index = pd.to_datetime(time_keys)
@@ -151,8 +174,6 @@ def check_stock(ticker, ind_map, target_date, cid, token):
         return {"error": f"Crash on {ticker}: {str(e)}"}
     
     finally:
-        # 🚨 STRICT THROTTLE: Placed in a 'finally' block so it mathematically 
-        # guarantees a 0.5s delay even if the code crashes, preventing Dhan IP bans.
         time.sleep(0.5) 
         
     return None
@@ -174,9 +195,11 @@ if st.button("🚀 Run Market Scan", type="primary"):
             tickers, ind_map = get_nifty_500()
         else:
             tickers, ind_map = get_all_nse()
+            
+        sec_map = get_dhan_security_map()
         
-        if not tickers:
-            st.error("Failed to pull market data from NSE.")
+        if not tickers or not sec_map:
+            st.error("Failed to pull market data or security map.")
         else:
             st.info(f"Crunching stocks via Native API... Processing safely to respect institutional limits.")
             
@@ -184,7 +207,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
             api_errors = []
             progress_bar = st.progress(0)
             
-            check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, cid=client_id, token=access_token)
+            check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, cid=client_id, token=access_token, sec_map=sec_map)
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 results = executor.map(check_func, tickers)
