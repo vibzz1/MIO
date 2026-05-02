@@ -38,8 +38,6 @@ def get_dhan_security_map():
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status() 
         df = pd.read_csv(io.StringIO(response.text), low_memory=False)
-        
-        # Rigorous mapping using Dhan's exact internal column IDs
         nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')]
         return dict(zip(nse_eq['SM_SYMBOL_NAME'], nse_eq['SEM_SMST_SECURITY_ID']))
     except Exception as e:
@@ -66,7 +64,7 @@ def get_all_nse():
         df.columns = df.columns.str.upper() 
         raw = df['SYMBOL'].tolist()
         tickers = list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
-        _, ind_map = get_nifty_500() # Borrow industry map
+        _, ind_map = get_nifty_500() 
         return tickers, ind_map
     except Exception as e:
         st.error(f"🚨 NSE Server Error: {e}")
@@ -78,12 +76,12 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
     if not sec_id: return None
 
     try:
-        # Time Machine Logic & Dhan Request Limits
         target_dt = pd.to_datetime(target_date)
         from_date = target_dt - datetime.timedelta(days=250)
         
-        req = dhan_client.get_historical_prices(
-            symbol=ticker,
+        # Fixed: Dhan v2.0.2 requires historical_daily_data with security_id
+        req = dhan_client.historical_daily_data(
+            security_id=str(sec_id),
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
             expiry_code=0,
@@ -91,24 +89,32 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             to_date=target_dt.strftime('%Y-%m-%d')
         )
         
-        # Rigorous Error Catching: Skip if Dhan returns empty data
-        if req.get('status') != 'success' or not req.get('data') or len(req['data']['close']) == 0:
+        if req.get('status') != 'success' or not req.get('data') or len(req['data'].get('close', [])) == 0:
             return None
             
         data = req['data']
         
-        # Force numeric data types to prevent calculation crashes
+        # Fixed: Dhan v2 uses 'timestamp' in epoch seconds
+        time_keys = data.get('timestamp') or data.get('start_Time')
+        if not time_keys: return None
+        
+        try:
+            dt_index = pd.to_datetime(time_keys, unit='s')
+        except:
+            dt_index = pd.to_datetime(time_keys)
+        
         df = pd.DataFrame({
             'Open': pd.to_numeric(data['open']),
             'High': pd.to_numeric(data['high']),
             'Low': pd.to_numeric(data['low']),
             'Close': pd.to_numeric(data['close']),
             'Volume': pd.to_numeric(data['volume'])
-        }, index=pd.to_datetime(data['start_Time']))
+        }, index=dt_index)
+        
+        df.sort_index(inplace=True) # Critical: Forces oldest-to-newest order for accurate MAs
         
         if len(df) < 70: return None
 
-        # Indicator Math
         df['SMA_10'] = ta.sma(df['Close'], length=10)
         df['SMA_20'] = ta.sma(df['Close'], length=20)
         df['SMA_50'] = ta.sma(df['Close'], length=50)
@@ -124,10 +130,10 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # The Exact MIO Criteria
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        c3 = (df['SMA_20'].iloc[-20:] >= df['SMA_50'].iloc[-20:]).all() 
+        # Reverted back to the relaxed 5-day rule to match your earlier results
+        c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all() 
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
@@ -140,10 +146,9 @@ def check_stock(ticker, ind_map, target_date, sec_map, dhan_client):
             industry = ind_map.get(ticker, 'N/A')
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
             
-    except Exception:
-        pass # Silently skip broken stocks to keep the scanner running
+    except Exception as e:
+        pass 
     
-    # Mandatory API Throttle: Prevents Dhan from blocking your IP
     time.sleep(0.15) 
     return None
 
@@ -170,14 +175,13 @@ if st.button("🚀 Run Market Scan", type="primary"):
         if not tickers or not sec_map:
             st.error("Failed to pull required data. Check the error messages above.")
         else:
-            st.info(f"Crunching {len(tickers)} stocks via Dhan API... This will take a few minutes due to API safety limits.")
+            st.info(f"Crunching {len(tickers)} stocks via Dhan API... This will take a few minutes.")
             
             passed_results = []
             progress_bar = st.progress(0)
             
             check_func = partial(check_stock, ind_map=ind_map, target_date=target_date, sec_map=sec_map, dhan_client=dhan)
             
-            # Locked at 5 workers to strictly respect Dhan API rate limits
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 results = executor.map(check_func, tickers)
                 for i, result in enumerate(results):
@@ -187,7 +191,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
             progress_bar.empty()
 
             if passed_results:
-                st.success(f"🔥 Found {len(passed_results)} setups!")
+                st.success(f"🔥 Found {len(passed_results)} setups on {target_date.strftime('%B %d, %Y')}!")
                 
                 # --- 1. LIST VIEW ---
                 st.subheader("📋 List View")
