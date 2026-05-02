@@ -200,16 +200,20 @@ if st.button("🚀 Run Market Scan", type="primary"):
                         "data": sma20,
                         "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
                     },
-                    {
-                        "type": 'Histogram',
-                        "data": volume,
-                        "options": {
-                            "priceFormat": {"type": 'volume'},
-                            "priceScaleId": "",
-                            "scaleMargins": {"top": 0.8, "bottom": 0}
+                  {
+                            "type": 'Histogram',
+                            "data": volume,
+                            "options": {
+                                "priceFormat": {"type": 'volume'},
+                                "priceScaleId": "", 
+                                "priceScale": {  # <--- We must nest the margins inside this specific dictionary
+                                    "scaleMargins": {
+                                        "top": 0.8, # This forces volume to stay in the bottom 20%
+                                        "bottom": 0
+                                    }
+                                }
+                            }
                         }
-                    }
-                ]
 
                 renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
                 st.markdown("---")
