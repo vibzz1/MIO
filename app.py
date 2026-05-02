@@ -7,46 +7,16 @@ from streamlit_lightweight_charts import renderLightweightCharts
 from nselib import capital_market
 from functools import partial
 import datetime
-import requests
-import io
-import time
+import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
 # --- UI Setup ---
 st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 st.title("📈 MIO Champion Setup Screener")
-st.markdown("Automated scan for high-probability momentum setups using a Direct Native Dhan API Tunnel.")
+st.markdown("Automated scan for high-probability momentum setups using split-adjusted data and Native TradingView charts.")
 
-# --- API Credentials ---
-st.sidebar.header("🔑 Dhan API Settings")
-raw_cid = st.sidebar.text_input("Client ID", type="password")
-raw_token = st.sidebar.text_input("Access Token", type="password")
-
-client_id = raw_cid.encode('ascii', 'ignore').decode().strip() if raw_cid else ""
-access_token = raw_token.encode('ascii', 'ignore').decode().strip() if raw_token else ""
-
-if not (client_id and access_token):
-    st.sidebar.warning("Please enter your Dhan API credentials to run the scan.")
-
-# --- Data Fetching & Security Mapping ---
-@st.cache_data(ttl=86400) 
-def get_dhan_security_map():
-    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status() 
-        df = pd.read_csv(io.StringIO(response.text), low_memory=False)
-        nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_SEGMENT'] == 'E')].copy()
-        
-        # RIGOROUS FIX: Forces IDs to be clean strings to prevent Pandas float-casting bugs
-        nse_eq['SEM_SMST_SECURITY_ID'] = pd.to_numeric(nse_eq['SEM_SMST_SECURITY_ID'], errors='coerce').fillna(0).astype(int).astype(str)
-        return dict(zip(nse_eq['SM_SYMBOL_NAME'], nse_eq['SEM_SMST_SECURITY_ID']))
-    except Exception as e:
-        st.error(f"🚨 Dhan Security Master Error: {e}")
-        return {}
-
+# --- Data Fetching ---
 @st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
@@ -71,72 +41,27 @@ def get_all_nse():
     except Exception as e:
         return [], {}
 
-# --- The Engine (Direct REST API Tunnel) ---
-def check_stock(ticker, ind_map, effective_date, cid, token, sec_map):
-    sec_id = sec_map.get(ticker)
-    if not sec_id or sec_id == "0": return None
-
+# --- The Engine (Adjusted yfinance Data) ---
+def check_stock(ticker, ind_map, effective_date):
     try:
-        # Expanding lookback to 365 days to guarantee we get enough valid trading days
-        from_date = effective_date - datetime.timedelta(days=365)
+        start_date = effective_date - datetime.timedelta(days=250)
+        # yfinance end date is exclusive, so we explicitly add 1 day to ensure the target date is captured
+        end_date = effective_date + datetime.timedelta(days=1) 
         
-        url = "https://api.dhan.co/charts/historical"
-        headers = {
-            "access-token": token,
-            "client-id": cid,
-            "Content-Type": "application/json"
-        }
+        # This natively handles all split/dividend adjustments to keep MAs perfectly smooth
+        ticker_obj = yf.Ticker(f"{ticker}.NS")
+        df = ticker_obj.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
         
-        payload = {
-            "securityId": str(sec_id),
-            "exchangeSegment": "NSE_EQ",
-            "instrument": "EQUITY",
-            "expiryCode": 0,
-            "fromDate": from_date.strftime('%Y-%m-%d'),
-            "toDate": effective_date.strftime('%Y-%m-%d')
-        }
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        
-        if response.status_code == 429:
-            return {"error": f"Rate Limit hit on {ticker}. Dhan is throttling us."}
+        if df.empty or len(df) < 70:
+            return {"error": f"Insufficient data for {ticker}"}
             
-        try:
-            req = response.json()
-        except ValueError:
-            return {"error": f"API returned blank data for {ticker}. Status: {response.status_code}"}
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         
-        if req.get('status') != 'success' or not req.get('data') or len(req['data'].get('close', [])) == 0:
-            return {"error": f"Dhan API returned empty data for {ticker}."}
-            
-        data = req['data']
-        time_keys = data.get('start_Time') or data.get('timestamp')
-        
-        if not time_keys:
-            return {"error": f"Missing timestamp data for {ticker}"}
-        
-        try:
-            if isinstance(time_keys[0], str) and "-" in time_keys[0]:
-                dt_index = pd.to_datetime(time_keys)
-            elif time_keys[0] > 1e11:
-                dt_index = pd.to_datetime(time_keys, unit='ms')
-            else:
-                dt_index = pd.to_datetime(time_keys, unit='s')
-        except:
-            dt_index = pd.to_datetime(time_keys)
-        
-        df = pd.DataFrame({
-            'Open': data['open'],
-            'High': data['high'],
-            'Low': data['low'],
-            'Close': data['close'],
-            'Volume': data['volume']
-        }, index=dt_index)
-        
-        df = df.apply(pd.to_numeric)
+        # Clean timezone issues
+        df.index = df.index.tz_localize(None) 
         df.sort_index(inplace=True) 
         
-        # RIGOROUS DATA SANITIZER: Deletes any fake holiday/weekend candles with 0 volume
+        # Rigorous Data Sanitizer
         df = df[df['Volume'] > 0]
         
         if len(df) < 70: return None
@@ -154,7 +79,6 @@ def check_stock(ticker, ind_map, effective_date, cid, token, sec_map):
 
         sma50_trend_dn_20 = df['SMA_50'].iloc[-1] < df['SMA_50'].iloc[-21]
         
-        # Now guaranteed to be the actual last trading day
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
@@ -175,9 +99,6 @@ def check_stock(ticker, ind_map, effective_date, cid, token, sec_map):
             
     except Exception as e:
         return {"error": f"Crash on {ticker}: {str(e)}"}
-    
-    finally:
-        time.sleep(0.5) 
         
     return None
 
@@ -190,120 +111,107 @@ with col1:
 with col2:
     raw_target_date = st.date_input("📅 Target Scan Date", value=datetime.date.today())
 
-# AUTO-DATE SNAPPER: Hijacks weekend dates and forces them backward to Friday
+# AUTO-DATE SNAPPER: Intelligently forces weekend requests back to Friday
 effective_target = pd.to_datetime(raw_target_date)
-while effective_target.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+while effective_target.weekday() >= 5: 
     effective_target -= datetime.timedelta(days=1)
 
 if st.button("🚀 Run Market Scan", type="primary"):
-    if not client_id or not access_token:
-        st.error("Please enter your Dhan API credentials in the sidebar first.")
+    if "Nifty 500" in scan_mode:
+        tickers, ind_map = get_nifty_500()
     else:
-        if "Nifty 500" in scan_mode:
-            tickers, ind_map = get_nifty_500()
-        else:
-            tickers, ind_map = get_all_nse()
-            
-        sec_map = get_dhan_security_map()
+        tickers, ind_map = get_all_nse()
         
-        if not tickers or not sec_map:
-            st.error("Failed to pull market data or security map.")
-        else:
-            if raw_target_date != effective_target.date():
-                st.warning(f"Weekend detected. Auto-snapping scan date back to last trading day: **{effective_target.strftime('%A, %B %d, %Y')}**")
+    if not tickers:
+        st.error("Failed to pull market data.")
+    else:
+        if raw_target_date != effective_target.date():
+            st.warning(f"Weekend detected. Auto-snapping scan date back to last trading day: **{effective_target.strftime('%A, %B %d, %Y')}**")
+            
+        st.info(f"Crunching stocks via High-Speed Adjusted Data Pipeline... Processing at full speed.")
+        
+        passed_results = []
+        progress_bar = st.progress(0)
+        
+        check_func = partial(check_stock, ind_map=ind_map, effective_date=effective_target)
+        
+        # Max workers massively increased because we are free from API rate limits
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            results = executor.map(check_func, tickers)
+            for i, result in enumerate(results):
+                if result and "error" not in result:
+                    passed_results.append(result)
+                progress_bar.progress(min((i + 1) / len(tickers), 1.0))
                 
-            st.info(f"Crunching stocks via Native API... Processing safely to respect institutional limits.")
-            
-            passed_results = []
-            api_errors = []
-            progress_bar = st.progress(0)
-            
-            check_func = partial(check_stock, ind_map=ind_map, effective_date=effective_target, cid=client_id, token=access_token, sec_map=sec_map)
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                results = executor.map(check_func, tickers)
-                for i, result in enumerate(results):
-                    if result:
-                        if "error" in result:
-                            api_errors.append(result["error"])
-                        else:
-                            passed_results.append(result)
-                    progress_bar.progress(min((i + 1) / len(tickers), 1.0))
-                    
-            progress_bar.empty()
+        progress_bar.empty()
 
-            if api_errors:
-                with st.expander("⚠️ View API Errors (Rate limits or missing data)"):
-                    for err in api_errors[:20]: 
-                        st.write(err)
+        if passed_results:
+            st.success(f"🔥 Found {len(passed_results)} setups for {effective_target.strftime('%B %d, %Y')}!")
+            
+            st.subheader("📋 List View")
+            df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
+            df_results.index = df_results.index + 1
+            st.dataframe(df_results, use_container_width=True)
 
-            if passed_results:
-                st.success(f"🔥 Found {len(passed_results)} setups for {effective_target.strftime('%B %d, %Y')}!")
+            st.divider()
+
+            st.subheader(f"📊 Chart View (Data up to {effective_target.strftime('%Y-%m-%d')})")
+            for res in passed_results:
+                st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
                 
-                st.subheader("📋 List View")
-                df_results = pd.DataFrame([{k: v for k, v in res.items() if k != 'chart_data'} for res in passed_results])
-                df_results.index = df_results.index + 1
-                st.dataframe(df_results, use_container_width=True)
+                df_plot = res['chart_data'].tail(150).copy()
+                df_plot['time'] = df_plot.index.strftime('%Y-%m-%d')
+                
+                candles = df_plot[['time', 'Open', 'High', 'Low', 'Close']].rename(
+                    columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}
+                ).to_dict('records')
+                
+                sma20 = df_plot[['time', 'SMA_20']].dropna().rename(
+                    columns={'SMA_20': 'value'}
+                ).to_dict('records')
 
-                st.divider()
+                volume = df_plot[['time', 'Volume', 'Close', 'Open']].copy()
+                volume['color'] = volume.apply(
+                    lambda row: 'rgba(0, 176, 96, 0.5)' if row['Close'] >= row['Open'] else 'rgba(255, 51, 58, 0.5)', axis=1
+                )
+                volume = volume[['time', 'Volume', 'color']].rename(columns={'Volume': 'value'}).to_dict('records')
 
-                st.subheader(f"📊 Chart View (Data up to {effective_target.strftime('%Y-%m-%d')})")
-                for res in passed_results:
-                    st.markdown(f"### **{res['Ticker']}** | {res['Industry']}")
-                    
-                    df_plot = res['chart_data'].tail(150).copy()
-                    df_plot['time'] = df_plot.index.strftime('%Y-%m-%d')
-                    
-                    candles = df_plot[['time', 'Open', 'High', 'Low', 'Close']].rename(
-                        columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}
-                    ).to_dict('records')
-                    
-                    sma20 = df_plot[['time', 'SMA_20']].dropna().rename(
-                        columns={'SMA_20': 'value'}
-                    ).to_dict('records')
+                chartOptions = {
+                    "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
+                    "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
+                    "crosshair": { "mode": 1 },
+                    "priceScale": { "borderColor": '#485c7b' },
+                    "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
+                    "height": 500
+                }
 
-                    volume = df_plot[['time', 'Volume', 'Close', 'Open']].copy()
-                    volume['color'] = volume.apply(
-                        lambda row: 'rgba(0, 176, 96, 0.5)' if row['Close'] >= row['Open'] else 'rgba(255, 51, 58, 0.5)', axis=1
-                    )
-                    volume = volume[['time', 'Volume', 'color']].rename(columns={'Volume': 'value'}).to_dict('records')
-
-                    chartOptions = {
-                        "layout": { "textColor": '#d1d4dc', "background": { "type": 'solid', "color": '#131722' } },
-                        "grid": { "vertLines": { "color": '#363c4e' }, "horzLines": { "color": '#363c4e' } },
-                        "crosshair": { "mode": 1 },
-                        "priceScale": { "borderColor": '#485c7b' },
-                        "timeScale": { "borderColor": '#485c7b', "timeVisible": True },
-                        "height": 500
-                    }
-
-                    series_list = [
-                        {
-                            "type": 'Candlestick',
-                            "data": candles,
-                            "options": {
-                                "upColor": '#00b060', "downColor": '#ff333a', 
-                                "borderVisible": False, 
-                                "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
-                            }
-                        },
-                        {
-                            "type": 'Line',
-                            "data": sma20,
-                            "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
-                        },
-                        {
-                            "type": 'Histogram',
-                            "data": volume,
-                            "options": {
-                                "priceFormat": {"type": 'volume'},
-                                "priceScaleId": "",
-                                "scaleMargins": {"top": 0.8, "bottom": 0}
-                            }
+                series_list = [
+                    {
+                        "type": 'Candlestick',
+                        "data": candles,
+                        "options": {
+                            "upColor": '#00b060', "downColor": '#ff333a', 
+                            "borderVisible": False, 
+                            "wickUpColor": '#00b060', "wickDownColor": '#ff333a'
                         }
-                    ]
+                    },
+                    {
+                        "type": 'Line',
+                        "data": sma20,
+                        "options": {"color": '#ffa726', "lineWidth": 2, "title": '20 DMA'}
+                    },
+                    {
+                        "type": 'Histogram',
+                        "data": volume,
+                        "options": {
+                            "priceFormat": {"type": 'volume'},
+                            "priceScaleId": "",
+                            "scaleMargins": {"top": 0.8, "bottom": 0}
+                        }
+                    }
+                ]
 
-                    renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
-                    st.markdown("---")
-            else:
-                st.warning(f"No stocks matched the criteria on {effective_target.strftime('%B %d, %Y')}.")
+                renderLightweightCharts([{"chart": chartOptions, "series": series_list}], 'chart_' + res['Ticker'])
+                st.markdown("---")
+        else:
+            st.warning(f"No stocks matched the criteria on {effective_target.strftime('%B %d, %Y')}.")
