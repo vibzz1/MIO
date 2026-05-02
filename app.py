@@ -30,20 +30,48 @@ else:
     st.sidebar.warning("Please enter your Dhan API credentials to run the scan.")
 
 # --- Data Fetching & Security Mapping ---
-@st.cache_data(ttl=86400) # Cache the security list for 24 hours
+@st.cache_data(ttl=86400) 
 def get_dhan_security_map():
-    # Dhan provides a daily CSV of all trading symbols and their internal IDs
     url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    # Added User-Agent header to bypass Dhan/Cloudflare bot protection
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     try:
-        response = requests.get(url)
-        df = pd.read_csv(io.StringIO(response.text))
-        # Filter for NSE Equity only
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status() # Force an error if the download fails
+        df = pd.read_csv(io.StringIO(response.text), low_memory=False)
         nse_eq = df[(df['EXCH_ID'] == 'NSE') & (df['INSTRUMENT'] == 'EQUITY')]
-        # Create a dictionary mapping Ticker -> Security ID
         return dict(zip(nse_eq['SEM_CUSTOM_SYMBOL'], nse_eq['SEM_SMST_SECURITY_ID']))
-    except:
+    except Exception as e:
+        st.error(f"🚨 Dhan Security Master Error: {e}")
         return {}
 
+@st.cache_data(ttl=3600)
+def get_nifty_500():
+    try:
+        n50 = capital_market.nifty50_equity_list()
+        nn50 = capital_market.niftynext50_equity_list()
+        mid150 = capital_market.niftymidcap150_equity_list()
+        sml250 = capital_market.niftysmallcap250_equity_list()
+        df = pd.concat([n50, nn50, mid150, sml250], ignore_index=True)
+        tickers = list(set(df['Symbol'].tolist()))
+        ind_map = dict(zip(df['Symbol'], df['Industry']))
+        return tickers, ind_map
+    except Exception as e:
+        st.error(f"🚨 NSE Server Error (Nifty 500): {e}. The NSE website might be down for weekend maintenance.")
+        return [], {}
+
+@st.cache_data(ttl=3600)
+def get_all_nse():
+    try:
+        df = capital_market.equity_list()
+        df.columns = df.columns.str.upper() 
+        raw = df['SYMBOL'].tolist()
+        tickers = list(set([t for t in raw if isinstance(t, str) and "DUMMY" not in t]))
+        _, ind_map = get_nifty_500()
+        return tickers, ind_map
+    except Exception as e:
+        st.error(f"🚨 NSE Server Error (All NSE): {e}. The NSE website might be down for weekend maintenance.")
+        return [], {}
 @st.cache_data(ttl=3600)
 def get_nifty_500():
     try:
