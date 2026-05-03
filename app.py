@@ -179,101 +179,166 @@ def score_base_quality(df, latest):
 
 def score_stage(df, latest):
     """
-    Stage (0-33): Is this a confirmed Stage 2 uptrend?
+    Stage (0-33): Where is this stock in the market cycle?
     
-    CRITICAL RULE: If 200DMA is trending DOWN, the stock is NOT in Stage 2.
-    It's either Stage 1 (recovery) or Stage 4 (decline). Cap score hard.
+    Best setups: Early S2 (1st base) or late S1 (S1b — 200DMA flattening, price crossing above)
+    Avoid: Late S2 (3rd/4th base, momentum fading), S1 early, S3, S4
+    
+    52W HIGH IS IRRELEVANT — we buy rising stocks and sell higher.
     """
     sma150 = latest.get('SMA_150', np.nan)
     sma200 = latest.get('SMA_200', np.nan)
     sma50 = latest['SMA_50']
+    sma20 = latest['SMA_20']
 
     # --- MA Stacking ---
-    # "Perfect" requires FULL alignment including long-term MAs
     sma_stack_perfect = False
-    sma_stack_good = latest['Close'] > latest['SMA_20'] > latest['SMA_50']
+    sma_stack_good = latest['Close'] > sma20 > sma50
 
     if not pd.isna(sma150) and not pd.isna(sma200):
         sma_stack_perfect = (
-            latest['Close'] > latest['SMA_10'] > latest['SMA_20'] >
-            sma50 > sma150 > sma200
+            latest['Close'] > latest['SMA_10'] > sma20 > sma50 > sma150 > sma200
         )
 
-    # --- 200 DMA Trend (THE key stage indicator) ---
+    # --- 200 DMA Trend & Value ---
     sma200_up = False
+    sma200_flat = False
     sma200_val = np.nan
-    if not pd.isna(sma200) and len(df) >= 21:
-        sma200_col = df['SMA_200'].dropna()
-        if len(sma200_col) >= 21:
-            sma200_up = sma200_col.iloc[-1] > sma200_col.iloc[-21]
-            sma200_val = sma200_col.iloc[-1]
+    has_200dma = False
+
+    sma200_col = df['SMA_200'].dropna() if 'SMA_200' in df.columns else pd.Series(dtype=float)
+
+    if len(sma200_col) >= 2:
+        has_200dma = True
+        sma200_val = sma200_col.iloc[-1]
+        lookback = min(len(sma200_col) - 1, 21)
+        pct_change_200 = (sma200_col.iloc[-1] / sma200_col.iloc[-1 - lookback] - 1) * 100
+        sma200_up = pct_change_200 > 0.5       # clearly rising
+        sma200_flat = -0.5 <= pct_change_200 <= 0.5  # flattening (S1b territory)
+    elif len(sma200_col) == 1:
+        has_200dma = True
+        sma200_val = sma200_col.iloc[-1]
+
+    # Fallback: 150DMA if 200 unavailable
+    if not has_200dma and 'SMA_150' in df.columns:
+        sma150_col = df['SMA_150'].dropna()
+        if len(sma150_col) >= 10:
+            lookback = min(len(sma150_col) - 1, 21)
+            pct_change_150 = (sma150_col.iloc[-1] / sma150_col.iloc[-1 - lookback] - 1) * 100
+            sma200_up = pct_change_150 > 0.5
+            sma200_flat = -0.5 <= pct_change_150 <= 0.5
+            sma200_val = sma150_col.iloc[-1]
+            has_200dma = True
 
     # --- Price vs 200DMA ---
-    price_above_200 = latest['Close'] > sma200_val if not pd.isna(sma200_val) else True
+    price_above_200 = latest['Close'] > sma200_val if has_200dma else False
+    dist_from_200 = ((latest['Close'] - sma200_val) / sma200_val * 100) if has_200dma and sma200_val > 0 else 0
 
-    # --- 50 vs 200 (death cross check) ---
-    sma50_above_200 = sma50 > sma200_val if not pd.isna(sma200_val) else True
+    # --- 50 vs 200 ---
+    sma50_above_200 = sma50 > sma200_val if has_200dma else False
 
-    # --- 52W Positioning ---
-    high_252, low_252 = df['High'].max(), df['Low'].min()
-    pct_above_low = (latest['Close'] - low_252) / low_252 * 100
-    pct_below_high = (high_252 - latest['Close']) / high_252 * 100
+    # --- BASE COUNT (key for early vs late S2) ---
+    # Count pullbacks to 20DMA in last ~120 bars (each touch-bounce ≈ one base)
+    base_count = 0
+    below_20 = False
+    lookback_bars = min(len(df), 120)
+    for i in range(-lookback_bars, 0):
+        close_i = df['Close'].iloc[i]
+        sma20_i = df['SMA_20'].iloc[i]
+        if close_i < sma20_i:
+            below_20 = True
+        elif below_20 and close_i > sma20_i:
+            base_count += 1
+            below_20 = False
+
+    # --- STAGE IDENTIFICATION ---
+    is_early_s2 = sma200_up and price_above_200 and sma50_above_200 and base_count <= 1
+    is_mid_s2 = sma200_up and price_above_200 and sma50_above_200 and base_count == 2
+    is_late_s2 = sma200_up and price_above_200 and base_count >= 3
+    is_s1b = (sma200_flat or (not sma200_up and sma50_above_200)) and price_above_200
+    is_s1_early = not sma200_up and not sma200_flat and price_above_200
+    is_s4_s1 = not sma200_up and not price_above_200
 
     # --- SCORING ---
     score = 0
 
-    # MA stacking points
+    # Component 1: MA alignment (0-10)
     if sma_stack_perfect:
-        score += 13
+        score += 10
     elif sma_stack_good:
-        score += 8
+        score += 6
     else:
-        score += 3
+        score += 2
 
-    # 200DMA trend bonus (only if UP)
+    # Component 2: 200DMA health (0-10)
     if sma200_up:
-        score += 7
+        score += 10
+    elif sma200_flat:
+        score += 5  # S1b — transitioning, has potential
+    else:
+        score += 0  # Down = no credit
 
-    # 52W positioning
-    score += 7 if pct_above_low >= 30 else (4 if pct_above_low >= 15 else 0)
-    score += 6 if pct_below_high <= 25 else (3 if pct_below_high <= 40 else 0)
+    # Component 3: Stage position & base count (0-13)
+    if is_early_s2:
+        score += 13  # 1st base in S2 — BEST setup
+    elif is_s1b:
+        score += 10  # Late S1, about to enter S2 — very good
+    elif is_mid_s2:
+        score += 8   # 2nd base — still tradeable
+    elif is_late_s2:
+        score += 3   # 3rd+ base — momentum fading, AVOID
+    elif is_s1_early:
+        score += 2   # Early S1 — too early
+    else:
+        score += 0   # S4/1 — no trade
 
     # =========================================================
-    # HARD PENALTIES — This is what was missing
+    # HARD PENALTIES
     # =========================================================
 
-    # PENALTY 1: 200DMA trending DOWN → stock is NOT Stage 2
-    # Cap the entire Stage score — no matter how good short-term MAs look
-    if not sma200_up and not pd.isna(sma200_val):
-        score = min(score, 10)  # Hard cap at 10/33
+    # 200DMA not rising and not flat → hard cap
+    if not sma200_up and not sma200_flat:
+        score = min(score, 10)
 
-    # PENALTY 2: Price below 200DMA → still recovering
+    # Price below 200DMA
     if not price_above_200:
         score -= 5
 
-    # PENALTY 3: 50DMA below 200DMA → death cross zone
+    # 50 below 200 (death cross territory)
     if not sma50_above_200:
         score -= 4
 
-    # PENALTY 4: More than 30% below 52W high → deep recovery, not fresh breakout
-    if pct_below_high > 30:
+    # Late S2 extended: price > 30% above 200DMA → stretched
+    if dist_from_200 > 30 and sma200_up:
         score -= 3
 
     score = max(min(score, 33), 0)
 
-    # --- Labels ---
-    stack_label = "Perfect" if sma_stack_perfect else ("Good" if sma_stack_good else "Weak")
+    # --- Stage label ---
+    if is_early_s2:
+        stg_label = "S2·1st"
+    elif is_s1b:
+        stg_label = "S1b"
+    elif is_mid_s2:
+        stg_label = "S2·2nd"
+    elif is_late_s2:
+        stg_label = f"S2·{base_count}th"
+    elif is_s1_early:
+        stg_label = "S1"
+    elif is_s4_s1:
+        stg_label = "S4/1"
+    else:
+        stg_label = "?"
 
-    stage_label = "Stage 2" if (sma200_up and price_above_200 and sma50_above_200) else \
-                  "Stage 1" if (not sma200_up and price_above_200) else \
-                  "Stage 4/1" if (not sma200_up and not price_above_200) else "Unclear"
+    stack_label = "Perfect" if sma_stack_perfect else ("Good" if sma_stack_good else "Weak")
 
     return score, {
         'MA Stack': stack_label,
-        '200DMA': "↑" if sma200_up else "↓",
-        'Stage': stage_label,
-        '>52WL': f"{pct_above_low:.0f}%",
-        '<52WH': f"{pct_below_high:.0f}%"
+        '200DMA': "↑" if sma200_up else ("→" if sma200_flat else "↓"),
+        'Stg': stg_label,
+        'Bases': base_count,
+        '>52WL': f"{((latest['Close'] - df['Low'].min()) / df['Low'].min() * 100):.0f}%",
+        'Dist 200': f"{dist_from_200:+.0f}%"
     }
 
 
