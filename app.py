@@ -493,30 +493,56 @@ def score_timing(df, latest):
     else:
         candle_pts = 0  # Red candle — not a trigger
 
-    # --- Breakout proximity (NEW) ---
-    # How close is price to breaking above recent resistance?
-    # Every Afzal trade has a horizontal line drawn at resistance
-    high_20 = df['High'].iloc[-20:].max()
+    # --- Breakout proximity ---
+    # Check if this is a FRESH breakout (1-3 days) or stale (already running)
+    # HFCL-type bug: stock broke out 10 days ago, every day sets new 20-bar high
+    # That's NOT a setup — you're late. Fresh breakout = first 1-3 days above resistance.
     high_50 = df['High'].iloc[-50:].max()
     pct_from_breakout = (high_50 - latest['Close']) / high_50 * 100
 
-    if latest['Close'] >= high_20:
-        bkout_pts = 8  # Breaking out TODAY — CAT, TSM, Delong moment
-    elif pct_from_breakout <= 3:
-        bkout_pts = 6  # Very close to breakout
+    # Count how many of last 10 bars closed above the PRIOR 50-bar high
+    # (measured excluding those bars themselves)
+    days_above_resistance = 0
+    for i in range(-10, 0):
+        prior_high = df['High'].iloc[:len(df)+i-1].iloc[-50:].max()  # 50-bar high BEFORE that day
+        if df['Close'].iloc[i] > prior_high * 0.98:
+            days_above_resistance += 1
+
+    is_fresh_breakout = days_above_resistance <= 3 and latest['Close'] >= high_50 * 0.98
+    is_stale_breakout = days_above_resistance > 5  # Running for 5+ days — you're late
+
+    if is_fresh_breakout:
+        bkout_pts = 8  # Fresh breakout — CAT, TSM, Delong moment
+    elif pct_from_breakout <= 3 and not is_stale_breakout:
+        bkout_pts = 6  # Very close to breakout, not yet stale
     elif pct_from_breakout <= 8:
         bkout_pts = 4  # Approaching
+    elif is_stale_breakout:
+        bkout_pts = 0  # Already running — HFCL territory, NOT a setup
     else:
-        bkout_pts = 1  # Far from breakout
+        bkout_pts = 1
 
-    score = min(ma_pts + vol_pts + candle_pts + bkout_pts, 34)
+    # --- EXTENSION HARD PENALTY ---
+    # If stock is >10% above 20DMA, it's extended — no matter how good other metrics
+    # HFCL at +28% above 20DMA = chase, not a setup
+    extension_penalty = 0
+    if pct_20dma > 15:
+        extension_penalty = 12  # Severely extended — kill the timing score
+    elif pct_20dma > 10:
+        extension_penalty = 8   # Extended — big penalty
+    elif pct_20dma > 8:
+        extension_penalty = 4   # Getting stretched
+
+    raw_score = ma_pts + vol_pts + candle_pts + bkout_pts
+    score = max(min(raw_score - extension_penalty, 34), 0)
 
     return score, {
         'Dist 20DMA': f"{pct_20dma:+.1f}%",
         'Vol Exp': f"{vol_expansion:.1f}x",
         'Body': f"{br:.0%}",
         'Close Pos': f"{close_position:.0%}",
-        'Near Bkout': f"{pct_from_breakout:.1f}%"
+        'Near Bkout': f"{pct_from_breakout:.1f}%",
+        'Bkout Age': f"{days_above_resistance}d"
     }
 
 
