@@ -18,10 +18,7 @@ st.set_page_config(page_title="MIO Champ Screener", layout="wide")
 
 st.markdown("""
 <style>
-    /* Dark modern theme overrides */
     .stApp { background-color: #0e1117; }
-    
-    /* Grade badges */
     .grade-badge {
         display: inline-block; padding: 8px 18px; border-radius: 8px;
         font-size: 26px; font-weight: 800; text-align: center;
@@ -31,8 +28,6 @@ st.markdown("""
     .grade-a { background: linear-gradient(135deg, #22c55e, #4ade80); color: #000; }
     .grade-b { background: linear-gradient(135deg, #eab308, #fbbf24); color: #000; }
     .grade-c { background: linear-gradient(135deg, #dc2626, #ef4444); }
-    
-    /* Score bars */
     .score-bar-bg {
         background: #1e222d; border-radius: 6px; height: 18px;
         margin-bottom: 6px; overflow: hidden;
@@ -45,22 +40,16 @@ st.markdown("""
     .bar-green { background: linear-gradient(90deg, #00b060, #00d47e); }
     .bar-yellow { background: linear-gradient(90deg, #eab308, #fbbf24); }
     .bar-red { background: linear-gradient(90deg, #dc2626, #ef4444); }
-    
-    /* Detail metrics */
     .detail-row {
         display: flex; justify-content: space-between; padding: 3px 0;
         font-size: 13px; border-bottom: 1px solid #1e222d;
     }
     .detail-label { color: #9ca3af; }
     .detail-value { color: #e5e7eb; font-weight: 600; }
-    
-    /* Section headers */
     .section-divider {
         background: linear-gradient(90deg, #00b060, transparent);
         height: 3px; border-radius: 2px; margin: 20px 0 10px 0;
     }
-    
-    /* Trade box */
     .trade-box {
         background: #1a1f2e; border: 1px solid #2d3748; border-radius: 10px;
         padding: 12px; margin-top: 8px;
@@ -189,32 +178,103 @@ def score_base_quality(df, latest):
 
 
 def score_stage(df, latest):
+    """
+    Stage (0-33): Is this a confirmed Stage 2 uptrend?
+    
+    CRITICAL RULE: If 200DMA is trending DOWN, the stock is NOT in Stage 2.
+    It's either Stage 1 (recovery) or Stage 4 (decline). Cap score hard.
+    """
     sma150 = latest.get('SMA_150', np.nan)
     sma200 = latest.get('SMA_200', np.nan)
+    sma50 = latest['SMA_50']
+
+    # --- MA Stacking ---
+    # "Perfect" requires FULL alignment including long-term MAs
     sma_stack_perfect = False
     sma_stack_good = latest['Close'] > latest['SMA_20'] > latest['SMA_50']
-    if not pd.isna(sma150):
-        sma_stack_perfect = latest['Close'] > latest['SMA_10'] > latest['SMA_20'] > latest['SMA_50'] > sma150
 
+    if not pd.isna(sma150) and not pd.isna(sma200):
+        sma_stack_perfect = (
+            latest['Close'] > latest['SMA_10'] > latest['SMA_20'] >
+            sma50 > sma150 > sma200
+        )
+
+    # --- 200 DMA Trend (THE key stage indicator) ---
     sma200_up = False
+    sma200_val = np.nan
     if not pd.isna(sma200) and len(df) >= 21:
         sma200_col = df['SMA_200'].dropna()
         if len(sma200_col) >= 21:
             sma200_up = sma200_col.iloc[-1] > sma200_col.iloc[-21]
+            sma200_val = sma200_col.iloc[-1]
 
+    # --- Price vs 200DMA ---
+    price_above_200 = latest['Close'] > sma200_val if not pd.isna(sma200_val) else True
+
+    # --- 50 vs 200 (death cross check) ---
+    sma50_above_200 = sma50 > sma200_val if not pd.isna(sma200_val) else True
+
+    # --- 52W Positioning ---
     high_252, low_252 = df['High'].max(), df['Low'].min()
     pct_above_low = (latest['Close'] - low_252) / low_252 * 100
     pct_below_high = (high_252 - latest['Close']) / high_252 * 100
 
-    score = 13 if sma_stack_perfect else (8 if sma_stack_good else 3)
-    if sma200_up: score += 7
+    # --- SCORING ---
+    score = 0
+
+    # MA stacking points
+    if sma_stack_perfect:
+        score += 13
+    elif sma_stack_good:
+        score += 8
+    else:
+        score += 3
+
+    # 200DMA trend bonus (only if UP)
+    if sma200_up:
+        score += 7
+
+    # 52W positioning
     score += 7 if pct_above_low >= 30 else (4 if pct_above_low >= 15 else 0)
     score += 6 if pct_below_high <= 25 else (3 if pct_below_high <= 40 else 0)
-    score = min(score, 33)
 
+    # =========================================================
+    # HARD PENALTIES — This is what was missing
+    # =========================================================
+
+    # PENALTY 1: 200DMA trending DOWN → stock is NOT Stage 2
+    # Cap the entire Stage score — no matter how good short-term MAs look
+    if not sma200_up and not pd.isna(sma200_val):
+        score = min(score, 10)  # Hard cap at 10/33
+
+    # PENALTY 2: Price below 200DMA → still recovering
+    if not price_above_200:
+        score -= 5
+
+    # PENALTY 3: 50DMA below 200DMA → death cross zone
+    if not sma50_above_200:
+        score -= 4
+
+    # PENALTY 4: More than 30% below 52W high → deep recovery, not fresh breakout
+    if pct_below_high > 30:
+        score -= 3
+
+    score = max(min(score, 33), 0)
+
+    # --- Labels ---
     stack_label = "Perfect" if sma_stack_perfect else ("Good" if sma_stack_good else "Weak")
-    return score, {'MA Stack': stack_label, '200DMA': "↑" if sma200_up else "↓",
-                   '>52WL': f"{pct_above_low:.0f}%", '<52WH': f"{pct_below_high:.0f}%"}
+
+    stage_label = "Stage 2" if (sma200_up and price_above_200 and sma50_above_200) else \
+                  "Stage 1" if (not sma200_up and price_above_200) else \
+                  "Stage 4/1" if (not sma200_up and not price_above_200) else "Unclear"
+
+    return score, {
+        'MA Stack': stack_label,
+        '200DMA': "↑" if sma200_up else "↓",
+        'Stage': stage_label,
+        '>52WL': f"{pct_above_low:.0f}%",
+        '<52WH': f"{pct_below_high:.0f}%"
+    }
 
 
 def score_timing(df, latest):
@@ -268,7 +328,7 @@ def score_setup(res):
 
 
 # =============================================================================
-# TV-STYLE CHART RENDERER
+# TV-STYLE CHART RENDERER (SMA20 only, no label)
 # =============================================================================
 
 def render_tv_chart(df, ticker, grade, total):
@@ -280,11 +340,9 @@ def render_tv_chart(df, ticker, grade, total):
                     "color": "#26a69a80" if r['Close'] >= r['Open'] else "#ef535080"}
                    for idx, r in df.iterrows()]
 
+    # Only 20 DMA — no label, no SMA50
     sma20_data = [{"time": idx.strftime("%Y-%m-%d"), "value": round(r['SMA_20'],2)}
                   for idx, r in df.iterrows() if not pd.isna(r.get('SMA_20', np.nan))]
-
-    sma50_data = [{"time": idx.strftime("%Y-%m-%d"), "value": round(r['SMA_50'],2)}
-                  for idx, r in df.iterrows() if not pd.isna(r.get('SMA_50', np.nan))]
 
     chart_opts = [
         {
@@ -314,9 +372,7 @@ def render_tv_chart(df, ticker, grade, total):
                      "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
                      "wickUpColor": "#26a69a", "wickDownColor": "#ef5350"}},
         {"type": "Line", "data": sma20_data,
-         "options": {"color": "#ff9800", "lineWidth": 2, "title": "20 DMA"}},
-        {"type": "Line", "data": sma50_data,
-         "options": {"color": "#ab47bc", "lineWidth": 2, "title": "50 DMA"}}
+         "options": {"color": "#ff9800", "lineWidth": 2, "title": ""}}
     ]
 
     series_vol = [
