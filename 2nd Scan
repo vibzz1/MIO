@@ -1,0 +1,567 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+import concurrent.futures
+import warnings
+from streamlit_lightweight_charts import renderLightweightCharts
+
+warnings.filterwarnings("ignore")
+
+# --- UI Setup ---
+st.set_page_config(page_title="Setup Quality Engine", layout="wide")
+st.title("🧠 Setup Quality Engine")
+st.caption("Paste MIO scan tickers → Base Quality · Stage · Timing → Ranked output with TV charts")
+
+# =============================================================================
+# DATA FETCHING
+# =============================================================================
+
+@st.cache_data(ttl=600)
+def fetch_stock_data(ticker):
+    symbol = f"{ticker}.NS"
+    try:
+        stock = yf.Ticker(symbol)
+        df = stock.history(period="1y")
+        if len(df) < 70:
+            return None
+
+        df.dropna(inplace=True)
+        df['SMA_10'] = ta.sma(df['Close'], length=10)
+        df['SMA_20'] = ta.sma(df['Close'], length=20)
+        df['SMA_50'] = ta.sma(df['Close'], length=50)
+        df['SMA_150'] = ta.sma(df['Close'], length=150)
+        df['SMA_200'] = ta.sma(df['Close'], length=200)
+        df['ATR_20'] = ta.atr(df['High'], df['Low'], df['Close'], length=20)
+        df['ATR_5'] = ta.atr(df['High'], df['Low'], df['Close'], length=5)
+        df['ATR_50'] = ta.atr(df['High'], df['Low'], df['Close'], length=50)
+        df['ADVOL_20'] = df['Volume'].rolling(20).mean()
+        df.dropna(inplace=True)
+
+        try:
+            industry = stock.info.get('industry', 'N/A')
+        except:
+            industry = 'N/A'
+
+        return {"Ticker": ticker, "Industry": industry, "df": df}
+    except:
+        return None
+
+
+# =============================================================================
+# SCORING ENGINE — 3 DIMENSIONS (Base / Stage / Timing)
+# =============================================================================
+
+def score_base_quality(df, latest):
+    """
+    Base Quality (0-33): Consolidation quality.
+    - Depth from 50d high (3-15% ideal)
+    - ATR contraction (vol dry-up)
+    - Tight closes in last 10 sessions
+    """
+    high_50 = df['High'].rolling(50).max().iloc[-1]
+    dist_from_peak = (high_50 - latest['Close']) / high_50 * 100
+
+    atr_5 = latest.get('ATR_5', 0)
+    atr_50 = latest.get('ATR_50', atr_5)
+    atr_contraction = (atr_50 - atr_5) / atr_50 * 100 if atr_50 > 0 else 0
+
+    if 3 <= dist_from_peak <= 15:
+        depth_pts = 13
+    elif 1 <= dist_from_peak < 3:
+        depth_pts = 9
+    elif 15 < dist_from_peak <= 25:
+        depth_pts = 6
+    elif dist_from_peak < 1:
+        depth_pts = 4
+    else:
+        depth_pts = 1
+
+    if atr_contraction >= 30:
+        tight_pts = 13
+    elif atr_contraction >= 15:
+        tight_pts = 9
+    elif atr_contraction >= 0:
+        tight_pts = 5
+    else:
+        tight_pts = 2
+
+    tight_days = sum(
+        abs(df['Close'].iloc[i] - df['Close'].iloc[i - 1]) / df['Close'].iloc[i - 1] < 0.01
+        for i in range(-10, 0)
+    )
+    tight_bonus = min(tight_days, 7)
+
+    score = min(depth_pts + tight_pts + tight_bonus, 33)
+
+    details = {
+        'Base Depth': f"{dist_from_peak:.1f}%",
+        'ATR Contr': f"{atr_contraction:.0f}%",
+        'Tight Days': tight_days
+    }
+    return score, details
+
+
+def score_stage(df, latest):
+    """
+    Stage (0-33): Is the stock in a proper uptrend?
+    - MA stacking: C > 10 > 20 > 50 > 150
+    - 200 DMA trending up
+    - 52W positioning
+    """
+    sma_stack_perfect = (
+        latest['Close'] > latest['SMA_10'] > latest['SMA_20'] >
+        latest['SMA_50'] > latest['SMA_150']
+    )
+    sma_stack_good = latest['Close'] > latest['SMA_20'] > latest['SMA_50']
+
+    sma200_up = False
+    if 'SMA_200' in df.columns and not pd.isna(latest.get('SMA_200', np.nan)):
+        sma200_up = latest['SMA_200'] > df['SMA_200'].iloc[-21] if len(df) >= 21 else False
+
+    high_252 = df['High'].max()
+    low_252 = df['Low'].min()
+    pct_above_52w_low = (latest['Close'] - low_252) / low_252 * 100
+    pct_below_52w_high = (high_252 - latest['Close']) / high_252 * 100
+
+    score = 0
+    if sma_stack_perfect:
+        score += 13
+    elif sma_stack_good:
+        score += 8
+    else:
+        score += 3
+
+    if sma200_up:
+        score += 7
+
+    if pct_above_52w_low >= 30:
+        score += 7
+    elif pct_above_52w_low >= 15:
+        score += 4
+
+    if pct_below_52w_high <= 25:
+        score += 6
+    elif pct_below_52w_high <= 40:
+        score += 3
+
+    score = min(score, 33)
+
+    stack_label = "Perfect" if sma_stack_perfect else ("Good" if sma_stack_good else "Weak")
+    details = {
+        'MA Stack': stack_label,
+        '200DMA': "Up" if sma200_up else "Flat/Down",
+        'Above 52WL': f"{pct_above_52w_low:.0f}%",
+        'Below 52WH': f"{pct_below_52w_high:.0f}%"
+    }
+    return score, details
+
+
+def score_timing(df, latest):
+    """
+    Timing (0-34): Is this the right entry?
+    - Distance from 20DMA
+    - Volume dry-up (pre-breakout signal)
+    - Candle quality
+    """
+    pct_from_20dma = ((latest['Close'] - latest['SMA_20']) / latest['SMA_20']) * 100
+    abs_dist = abs(pct_from_20dma)
+
+    if abs_dist <= 1:
+        ma_pts = 13
+    elif abs_dist <= 3:
+        ma_pts = 10
+    elif abs_dist <= 5:
+        ma_pts = 6
+    else:
+        ma_pts = 2
+
+    vol_5 = df['Volume'].iloc[-5:].mean()
+    vol_20 = latest['ADVOL_20']
+    vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
+
+    if vol_ratio < 0.7:
+        vol_pts = 11
+    elif vol_ratio < 0.9:
+        vol_pts = 7
+    elif vol_ratio < 1.2:
+        vol_pts = 4
+    else:
+        vol_pts = 1
+
+    candle_range = latest['High'] - latest['Low']
+    candle_body = abs(latest['Close'] - latest['Open'])
+    body_ratio = candle_body / candle_range if candle_range > 0 else 0
+
+    if body_ratio > 0.6 and latest['Close'] > latest['Open']:
+        candle_pts = 10
+    elif latest['Close'] > latest['Open']:
+        candle_pts = 5
+    else:
+        candle_pts = 1
+
+    score = min(ma_pts + vol_pts + candle_pts, 34)
+
+    details = {
+        'Dist 20DMA': f"{pct_from_20dma:+.1f}%",
+        'Vol Ratio': f"{vol_ratio:.2f}",
+        'Body%': f"{body_ratio:.0%}"
+    }
+    return score, details
+
+
+def full_score(result):
+    df = result['df']
+    latest = df.iloc[-1]
+    ticker = result['Ticker']
+
+    base_score, base_det = score_base_quality(df, latest)
+    stage_score, stage_det = score_stage(df, latest)
+    timing_score, timing_det = score_timing(df, latest)
+
+    total = base_score + stage_score + timing_score
+
+    if total >= 75:
+        grade = "A+"
+    elif total >= 60:
+        grade = "A"
+    elif total >= 45:
+        grade = "B"
+    else:
+        grade = "C"
+
+    # SL = below base low (lowest low in last 50 bars)
+    base_low = df['Low'].iloc[-50:].min()
+    entry = latest['Close']
+    sl = round(base_low * 0.995, 2)  # small buffer below base low
+    risk = round((entry - sl) / entry * 100, 1)
+
+    return {
+        'Ticker': ticker,
+        'Industry': result['Industry'],
+        'CMP': round(entry, 2),
+        'Grade': grade,
+        'Total': total,
+        'Base': base_score,
+        'Stage': stage_score,
+        'Timing': timing_score,
+        'Entry': round(entry, 2),
+        'SL': sl,
+        'Risk%': risk,
+        'Base Depth': base_det['Base Depth'],
+        'ATR Contr': base_det['ATR Contr'],
+        'Tight Days': base_det['Tight Days'],
+        'MA Stack': stage_det['MA Stack'],
+        '200DMA': stage_det['200DMA'],
+        'Above 52WL': stage_det['Above 52WL'],
+        'Below 52WH': stage_det['Below 52WH'],
+        'Dist 20DMA': timing_det['Dist 20DMA'],
+        'Vol Ratio': timing_det['Vol Ratio'],
+        'Body%': timing_det['Body%'],
+        'df': df
+    }
+
+
+# =============================================================================
+# TV-STYLE CHART RENDERER
+# =============================================================================
+
+def render_tv_chart(df, ticker, grade, total):
+    """Render TradingView-style chart using streamlit-lightweight-charts."""
+
+    # Prepare candlestick data
+    candle_data = []
+    for idx, row in df.iterrows():
+        candle_data.append({
+            "time": idx.strftime("%Y-%m-%d"),
+            "open": round(row['Open'], 2),
+            "high": round(row['High'], 2),
+            "low": round(row['Low'], 2),
+            "close": round(row['Close'], 2)
+        })
+
+    # Prepare volume data
+    volume_data = []
+    for idx, row in df.iterrows():
+        color = "#26a69a" if row['Close'] >= row['Open'] else "#ef5350"
+        volume_data.append({
+            "time": idx.strftime("%Y-%m-%d"),
+            "value": int(row['Volume']),
+            "color": color
+        })
+
+    # Prepare SMA data
+    sma20_data = []
+    sma50_data = []
+    for idx, row in df.iterrows():
+        if not pd.isna(row.get('SMA_20', np.nan)):
+            sma20_data.append({
+                "time": idx.strftime("%Y-%m-%d"),
+                "value": round(row['SMA_20'], 2)
+            })
+        if not pd.isna(row.get('SMA_50', np.nan)):
+            sma50_data.append({
+                "time": idx.strftime("%Y-%m-%d"),
+                "value": round(row['SMA_50'], 2)
+            })
+
+    chartMultipaneOptions = [
+        {
+            "height": 400,
+            "layout": {
+                "background": {"type": "solid", "color": "#131722"},
+                "textColor": "#d1d4dc",
+                "fontSize": 12
+            },
+            "grid": {
+                "vertLines": {"color": "#1e222d"},
+                "horzLines": {"color": "#1e222d"}
+            },
+            "crosshair": {"mode": 0},
+            "priceScale": {"borderColor": "#485c7b"},
+            "timeScale": {"borderColor": "#485c7b", "timeVisible": False},
+            "watermark": {
+                "visible": True,
+                "fontSize": 36,
+                "horzAlign": "center",
+                "vertAlign": "center",
+                "color": "rgba(255, 255, 255, 0.04)",
+                "text": f"{ticker} | {grade} ({total})"
+            }
+        },
+        {
+            "height": 150,
+            "layout": {
+                "background": {"type": "solid", "color": "#131722"},
+                "textColor": "#d1d4dc",
+                "fontSize": 12
+            },
+            "grid": {
+                "vertLines": {"color": "#1e222d"},
+                "horzLines": {"color": "#1e222d"}
+            },
+            "timeScale": {"borderColor": "#485c7b", "timeVisible": False}
+        }
+    ]
+
+    seriesCandlestickChart = [
+        {
+            "type": "Candlestick",
+            "data": candle_data,
+            "options": {
+                "upColor": "#26a69a",
+                "downColor": "#ef5350",
+                "borderUpColor": "#26a69a",
+                "borderDownColor": "#ef5350",
+                "wickUpColor": "#26a69a",
+                "wickDownColor": "#ef5350"
+            }
+        },
+        {
+            "type": "Line",
+            "data": sma20_data,
+            "options": {
+                "color": "#ff9800",
+                "lineWidth": 2,
+                "title": "20 DMA"
+            }
+        },
+        {
+            "type": "Line",
+            "data": sma50_data,
+            "options": {
+                "color": "#ab47bc",
+                "lineWidth": 2,
+                "title": "50 DMA"
+            }
+        }
+    ]
+
+    seriesVolumeChart = [
+        {
+            "type": "Histogram",
+            "data": volume_data,
+            "options": {
+                "priceFormat": {"type": "volume"},
+                "priceScaleId": "vol"
+            }
+        }
+    ]
+
+    renderLightweightCharts([
+        {"chart": chartMultipaneOptions[0], "series": seriesCandlestickChart},
+        {"chart": chartMultipaneOptions[1], "series": seriesVolumeChart}
+    ], key=f"chart_{ticker}")
+
+
+# =============================================================================
+# UI
+# =============================================================================
+
+st.markdown("---")
+
+tickers_input = st.text_area(
+    "Paste tickers from MIO Scanner (comma or space separated):",
+    placeholder="e.g. HAL, BDL, AVANTIFEED, GESHIP, LT, VEDL, ANUPAMRAS",
+    height=80
+)
+
+col_a, col_b = st.columns(2)
+with col_a:
+    min_grade = st.select_slider("Min Grade:", ["C", "B", "A", "A+"], value="B")
+with col_b:
+    show_charts = st.checkbox("Show TV charts", value=True)
+
+if st.button("🧠 Score Setups", type="primary"):
+
+    raw = tickers_input.replace(",", " ").replace("\n", " ").split()
+    tickers = [t.strip().upper() for t in raw if t.strip()]
+
+    if not tickers:
+        st.error("Paste at least 1 ticker.")
+    else:
+        st.info(f"Fetching data for {len(tickers)} stocks...")
+        progress = st.progress(0, text="Fetching...")
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as exe:
+            futures = {exe.submit(fetch_stock_data, t): t for t in tickers}
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                res = future.result()
+                if res:
+                    results.append(res)
+                progress.progress((i + 1) / len(tickers), text=f"Fetched {i+1}/{len(tickers)}")
+
+        progress.empty()
+
+        if not results:
+            st.error("Could not fetch data for any ticker. Check symbols.")
+        else:
+            st.info(f"🧠 Scoring {len(results)} stocks...")
+            scored = []
+            for res in results:
+                try:
+                    scored.append(full_score(res))
+                except Exception as e:
+                    st.warning(f"Skipped {res['Ticker']}: {e}")
+
+            grade_map = {"A+": 4, "A": 3, "B": 2, "C": 1}
+            min_val = grade_map[min_grade]
+            filtered = [s for s in scored if grade_map.get(s['Grade'], 0) >= min_val]
+            filtered.sort(key=lambda x: x['Total'], reverse=True)
+
+            if not filtered:
+                st.warning(f"No stocks scored {min_grade}+. Showing all.")
+                filtered = sorted(scored, key=lambda x: x['Total'], reverse=True)
+
+            st.success(f"🏆 {len(filtered)} setups scored {min_grade}+")
+
+            # ============================================================
+            # SCORECARD TABLE
+            # ============================================================
+            st.subheader("📋 Ranked Scorecard")
+
+            table_cols = [
+                'Ticker', 'Industry', 'CMP', 'Grade', 'Total',
+                'Base', 'Stage', 'Timing',
+                'Entry', 'SL', 'Risk%',
+                'Base Depth', 'ATR Contr', 'Tight Days',
+                'MA Stack', '200DMA', 'Above 52WL', 'Below 52WH',
+                'Dist 20DMA', 'Vol Ratio', 'Body%'
+            ]
+            df_table = pd.DataFrame([{k: v for k, v in s.items() if k in table_cols} for s in filtered])
+            df_table.index = df_table.index + 1
+
+            def color_grade(val):
+                colors = {
+                    "A+": "background-color:#26a69a;color:white;font-weight:bold",
+                    "A": "background-color:#4ade80;color:black;font-weight:bold",
+                    "B": "background-color:#fbbf24;color:black",
+                    "C": "background-color:#ef5350;color:white"
+                }
+                return colors.get(val, "")
+
+            def color_total(val):
+                try:
+                    v = int(val)
+                    if v >= 75:
+                        return "background-color:#26a69a;color:white"
+                    elif v >= 60:
+                        return "background-color:#4ade80;color:black"
+                    elif v >= 45:
+                        return "background-color:#fbbf24;color:black"
+                    else:
+                        return "background-color:#ef5350;color:white"
+                except:
+                    return ""
+
+            styled = df_table.style.applymap(color_grade, subset=['Grade']).applymap(color_total, subset=['Total'])
+            st.dataframe(styled, use_container_width=True, height=400)
+
+            st.divider()
+
+            # ============================================================
+            # SCORE BREAKDOWN — HORIZONTAL BAR
+            # ============================================================
+            st.subheader("📊 Score Breakdown")
+
+            for res in filtered[:15]:
+                t = res['Ticker']
+                total = res['Total']
+                base = res['Base']
+                stage = res['Stage']
+                timing = res['Timing']
+                grade = res['Grade']
+
+                grade_emoji = {"A+": "🟢", "A": "🟡", "B": "🟠", "C": "🔴"}.get(grade, "⚪")
+
+                # Visual bar using unicode blocks
+                bar_base = "█" * (base // 2)
+                bar_stage = "█" * (stage // 2)
+                bar_timing = "█" * (timing // 2)
+
+                st.markdown(
+                    f"{grade_emoji} **{t}** ({grade} · {total}/100) — "
+                    f"🧱 Base `{base}/33` · 📶 Stage `{stage}/33` · ⏱️ Timing `{timing}/34`"
+                )
+
+            st.divider()
+
+            # ============================================================
+            # TV-STYLE CHARTS
+            # ============================================================
+            if show_charts:
+                st.subheader("📈 Daily Charts (TradingView Style)")
+
+                for res in filtered[:10]:
+                    ticker = res['Ticker']
+                    grade = res['Grade']
+                    total = res['Total']
+
+                    col1, col2 = st.columns([4, 1])
+
+                    with col1:
+                        st.markdown(
+                            f"### {grade} | **{ticker}** — {total}/100 | {res['Industry']}"
+                        )
+                        render_tv_chart(res['df'], ticker, grade, total)
+
+                    with col2:
+                        st.markdown("**Scores**")
+                        for dim, mx, emoji in [('Base', 33, '🧱'), ('Stage', 33, '📶'), ('Timing', 34, '⏱️')]:
+                            val = res[dim]
+                            pct = val / mx
+                            bars = int(pct * 10)
+                            bar = "█" * bars + "░" * (10 - bars)
+                            st.markdown(f"{emoji} **{dim}**: {val}/{mx}\n`{bar}`")
+
+                        st.divider()
+                        st.metric("Entry", f"₹{res['Entry']}")
+                        st.metric("SL (Base Low)", f"₹{res['SL']}")
+                        st.metric("Risk", f"{res['Risk%']}%")
+                        st.markdown(f"**Dist 20DMA:** {res['Dist 20DMA']}")
+                        st.markdown(f"**Vol Ratio:** {res['Vol Ratio']}")
+
+                    st.markdown("---")
+
