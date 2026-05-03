@@ -4,3 +4,5 @@ pandas-ta
 nselib
 streamlit-lightweight-charts
 yfinance
+numpy
+plotly
