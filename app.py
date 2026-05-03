@@ -401,7 +401,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
                     else: return "background-color:#ff333a;color:white"
                 except: return ""
 
-            styled = df_scored.style.applymap(color_grade, subset=['Grade']).applymap(color_score, subset=['Score'])
+            styled = df_scored.style.map(color_grade, subset=['Grade']).map(color_score, subset=['Score'])
             st.dataframe(styled, use_container_width=True, height=500)
 
             st.divider()
