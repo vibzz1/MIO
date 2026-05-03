@@ -5,4 +5,3 @@ nselib
 streamlit-lightweight-charts
 yfinance
 numpy
-plotly
