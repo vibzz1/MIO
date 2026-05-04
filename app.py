@@ -61,7 +61,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown("## 📈 MIO Champion Setup Screener")
-st.markdown("*Scan → Score → Rank · Calibrated against 41 real setups*")
+st.markdown("*Scan → Score → Rank · Calibrated against real setups*")
 
 # =============================================================================
 # DATA FETCHING (ORIGINAL — UNTOUCHED)
@@ -138,19 +138,7 @@ def check_stock(ticker, ind_map):
     return None
 
 # =============================================================================
-# LAYER 2: SCORING ENGINE v2
-# Calibrated against 41 real charts from Afzal's Champions Club
-#
-# What every A+ setup has (studied from CAT, TSM, MU, Delong, TRT,
-# TDPOWERSYS, DATAPATTNS, INDIANB, HINDCOPPER, POCL, FEDFINA, GRMOVER,
-# THANGAMAYL, SENORES, VEDL, MOTHERSON, NMDC, BANKBARODA, ONGC, AVANTI,
-# CHENNPETRO, ANUPAMRAS, UPL, Luxshare, Resonac, Daewon Cable, etc.):
-#
-# 1. STRONG PRIOR MOVE: 30-200% clean staircase before base
-# 2. VOLUME 3-ACT STORY: Expansion (move) → Contraction (base) → Expansion (trigger)
-# 3. BASE AT RESISTANCE: Consolidation near prior highs, not in middle of nowhere
-# 4. CLEAN STRUCTURE: Not choppy — smooth candles, clear direction
-# 5. SETUP CANDLE: Green, strong body, confirming end of base
+# LAYER 2: SCORING ENGINE v3 — FIXED FOR BREAKOUT-DAY DISTORTION
 # =============================================================================
 
 def _enrich_df(df):
@@ -167,55 +155,73 @@ def _enrich_df(df):
 
 # ------------------------------------------------------------------
 # DIMENSION 1: BASE QUALITY (0-33)
-# What it checks: Is the consolidation well-formed?
-# A+ bases: tight, shallow (3-15% from peak), volume drying up,
-# ATR contracting, forming at/near resistance
+# FIX v3: Measure base metrics BEFORE trigger candle (iloc[-2])
+#          so a +14% breakout day doesn't distort ATR/volume readings.
+#          Also: normalize base depth against prior rally magnitude.
 # ------------------------------------------------------------------
 def score_base_quality(df, latest):
-    # --- Base depth from recent high ---
-    high_50 = df['High'].rolling(50).max().iloc[-1]
-    dist_from_peak = (high_50 - latest['Close']) / high_50 * 100
+    # Use pre-trigger bar for base quality measurement
+    pre_trigger = df.iloc[-2]
+    
+    # --- Base depth from recent high (use pre-trigger) ---
+    high_50 = df['High'].iloc[-51:-1].max()  # 50-bar high BEFORE trigger
+    dist_from_peak = (high_50 - pre_trigger['Close']) / high_50 * 100
 
-    # --- ATR contraction (current vs historical) ---
-    atr_5 = latest.get('ATR_5', 0) if not pd.isna(latest.get('ATR_5', np.nan)) else 0
-    atr_50 = latest.get('ATR_50', atr_5) if not pd.isna(latest.get('ATR_50', np.nan)) else atr_5
-    atr_contraction = (atr_50 - atr_5) / atr_50 * 100 if atr_50 > 0 else 0
+    # --- ATR contraction (BEFORE trigger candle) ---
+    # Recompute ATR_5 excluding today's candle
+    if len(df) >= 7:
+        atr_5_pre = ta.atr(df['High'].iloc[-7:-1], df['Low'].iloc[-7:-1], 
+                           df['Close'].iloc[-7:-1], length=5)
+        atr_5_val = atr_5_pre.iloc[-1] if atr_5_pre is not None and len(atr_5_pre) > 0 else 0
+    else:
+        atr_5_val = 0
+    atr_50_val = pre_trigger.get('ATR_50', atr_5_val)
+    if pd.isna(atr_5_val): atr_5_val = 0
+    if pd.isna(atr_50_val): atr_50_val = atr_5_val
+    atr_contraction = (atr_50_val - atr_5_val) / atr_50_val * 100 if atr_50_val > 0 else 0
 
-    # --- VOLUME 3-ACT STORY (NEW) ---
-    # Compare volume during base (last 15 bars) vs prior move (bars -50 to -15)
-    # Every A+ setup shows volume drying up in the base
-    vol_base = df['Volume'].iloc[-15:].mean()
+    # --- VOLUME 3-ACT STORY (BEFORE trigger) ---
+    vol_base = df['Volume'].iloc[-16:-1].mean()  # base period excl today
     vol_prior = df['Volume'].iloc[-50:-15].mean() if len(df) >= 50 else vol_base
     vol_contraction = (vol_prior - vol_base) / vol_prior * 100 if vol_prior > 0 else 0
 
-    # --- BASE AT RESISTANCE (NEW) ---
-    # Is price near the highest high of last 100 bars? (forming at resistance)
-    # A+ setups form bases AT or NEAR prior highs, not in the middle
+    # --- BASE AT RESISTANCE ---
     high_100 = df['High'].iloc[-100:].max() if len(df) >= 100 else df['High'].max()
-    pct_from_resistance = (high_100 - latest['Close']) / high_100 * 100
+    pct_from_resistance = (high_100 - pre_trigger['Close']) / high_100 * 100
 
-    # --- Tight closes ---
+    # --- DEPTH vs PRIOR RALLY (NEW) ---
+    # A 50% pullback after 200% run is HEALTHY. A 15% pullback after 20% run is noise.
+    low_200 = df['Low'].iloc[-min(len(df), 200):].min()
+    prior_rally = (high_100 / low_200 - 1) * 100 if low_200 > 0 else 0
+    depth_ratio = dist_from_peak / prior_rally if prior_rally > 0 else 1
+    # depth_ratio < 0.5 means correction is less than half the rally — healthy
+
+    # --- Tight closes (BEFORE trigger) ---
     tight_days = sum(
         abs(df['Close'].iloc[i] - df['Close'].iloc[i-1]) / df['Close'].iloc[i-1] < 0.015
-        for i in range(-10, 0)
+        for i in range(-11, -1)  # exclude trigger day
     )
 
     # --- SCORING ---
     score = 0
 
-    # Base depth (0-8): 3-15% from peak is ideal
-    if 3 <= dist_from_peak <= 15:
+    # Base depth (0-8): 3-15% from peak is ideal, BUT adjust for rally size
+    if depth_ratio <= 0.3 and dist_from_peak >= 3:
+        score += 8  # Shallow relative to rally — KNOWLEDG, HINDCOPPER territory
+    elif 3 <= dist_from_peak <= 15:
         score += 8
     elif 1 <= dist_from_peak < 3:
         score += 6
     elif 15 < dist_from_peak <= 25:
-        score += 4
+        score += 5 if depth_ratio <= 0.4 else 4  # Deeper but healthy if rally was big
     elif dist_from_peak < 1:
-        score += 3  # at highs, no real base formed
+        score += 3  # at highs, no real base
+    elif 25 < dist_from_peak <= 50 and depth_ratio <= 0.3:
+        score += 5  # Deep in absolute terms but small relative to a monster rally
     else:
         score += 1
 
-    # ATR contraction (0-8): volatility drying up in base
+    # ATR contraction (0-8)
     if atr_contraction >= 30:
         score += 8
     elif atr_contraction >= 15:
@@ -223,25 +229,29 @@ def score_base_quality(df, latest):
     elif atr_contraction >= 0:
         score += 3
     else:
-        score += 1  # volatility expanding = bad
+        score += 1
 
-    # Volume contraction in base (0-8): THE 3-act story
+    # Volume contraction in base (0-8)
     if vol_contraction >= 40:
-        score += 8  # major dry-up — textbook
+        score += 8
     elif vol_contraction >= 20:
         score += 6
     elif vol_contraction >= 5:
         score += 4
     else:
-        score += 1  # no contraction — not a real base
+        score += 1
 
     # Base at resistance (0-5): near prior highs = better
+    # BUT: for stocks coming off a huge rally then basing, "resistance" is far above.
+    # In that case, reward forming at the base's OWN resistance (50-bar high).
     if pct_from_resistance <= 5:
-        score += 5  # at resistance — breakout territory
+        score += 5
     elif pct_from_resistance <= 15:
-        score += 3  # building toward resistance
+        score += 3
+    elif pct_from_resistance <= 30 and depth_ratio <= 0.3:
+        score += 3  # Far from ATH but healthy pullback from huge rally
     else:
-        score += 1  # far from resistance
+        score += 1
 
     # Tight closes bonus (0-4)
     score += min(tight_days, 4)
@@ -253,18 +263,16 @@ def score_base_quality(df, latest):
         'ATR Contr': f"{atr_contraction:.0f}%",
         'Vol Contr': f"{vol_contraction:.0f}%",
         'Near Res': f"{pct_from_resistance:.0f}%",
+        'Depth/Rally': f"{depth_ratio:.2f}",
         'Tight Days': tight_days
     }
 
 
 # ------------------------------------------------------------------
 # DIMENSION 2: STAGE + PRIOR MOVE (0-33)
-# What it checks: Is the stock in the RIGHT part of the cycle?
-# AND was the move INTO the base clean and strong?
-#
-# A+ setups: Strong 30-200% clean staircase → then base
-# 200DMA rising, early S2 (1st-2nd base), MA perfectly stacked
-# BAD: Choppy recovery (Berger), late S2 (3rd+ base), 200DMA down
+# FIX v3: S1b with strong prior move + price reclaiming 200DMA
+#          gets a higher cap (20 instead of 12). The hard cap only
+#          crushes genuine Stage 4 declines with no prior move.
 # ------------------------------------------------------------------
 def score_stage(df, latest):
     sma150 = latest.get('SMA_150', np.nan)
@@ -284,8 +292,10 @@ def score_stage(df, latest):
     # --- 200 DMA Trend ---
     sma200_up = False
     sma200_flat = False
+    sma200_dn = False
     sma200_val = np.nan
     has_200dma = False
+    pct_change_200 = 0
 
     sma200_col = df['SMA_200'].dropna() if 'SMA_200' in df.columns else pd.Series(dtype=float)
     if len(sma200_col) >= 2:
@@ -295,6 +305,7 @@ def score_stage(df, latest):
         pct_change_200 = (sma200_col.iloc[-1] / sma200_col.iloc[-1 - lookback] - 1) * 100
         sma200_up = pct_change_200 > 0.5
         sma200_flat = -0.5 <= pct_change_200 <= 0.5
+        sma200_dn = pct_change_200 < -0.5
 
     if not has_200dma and 'SMA_150' in df.columns:
         sma150_col = df['SMA_150'].dropna()
@@ -303,16 +314,20 @@ def score_stage(df, latest):
             pct_change_150 = (sma150_col.iloc[-1] / sma150_col.iloc[-1 - lookback] - 1) * 100
             sma200_up = pct_change_150 > 0.5
             sma200_flat = -0.5 <= pct_change_150 <= 0.5
+            sma200_dn = pct_change_150 < -0.5
             sma200_val = sma150_col.iloc[-1]
             has_200dma = True
+            pct_change_200 = pct_change_150
 
     price_above_200 = latest['Close'] > sma200_val if has_200dma else False
     sma50_above_200 = sma50 > sma200_val if has_200dma else False
     dist_from_200 = ((latest['Close'] - sma200_val) / sma200_val * 100) if has_200dma and sma200_val > 0 else 0
 
-    # --- BASE COUNT (FIXED) ---
-    # A real base needs a meaningful pullback (≥5% from local high)
-    # Not every 20DMA wiggle. This was overcounting before.
+    # --- 200DMA RATE OF DECLINE (NEW) ---
+    # Distinguish "200DMA declining fast" (genuine S4) from "200DMA barely declining / flattening out" (S1b transition)
+    sma200_flattening = has_200dma and sma200_dn and pct_change_200 > -2.0  # declining but slowly
+
+    # --- BASE COUNT ---
     base_count = 0
     lookback_bars = min(len(df), 120)
     local_high = df['Close'].iloc[-lookback_bars]
@@ -320,27 +335,22 @@ def score_stage(df, latest):
 
     for i in range(-lookback_bars, 0):
         close_i = df['Close'].iloc[i]
-        # Track running high
         if close_i > local_high:
             local_high = close_i
-        # Pullback starts when price drops 5%+ from local high
         pullback_pct = (local_high - close_i) / local_high * 100
         if pullback_pct >= 5 and not in_pullback:
             in_pullback = True
-        # Pullback ends when price recovers above local high
         elif in_pullback and close_i >= local_high * 0.97:
             base_count += 1
             in_pullback = False
             local_high = close_i
 
-    # --- PRIOR MOVE QUALITY (NEW — the biggest missing piece) ---
-    # Every A+ setup has a strong, clean move BEFORE the base
-    # Measure: price gain from lowest low in last 200 bars to recent high
+    # --- PRIOR MOVE QUALITY ---
     low_200 = df['Low'].iloc[-min(len(df), 200):].min()
     high_recent = df['High'].iloc[-50:].max()
     prior_move_pct = (high_recent / low_200 - 1) * 100 if low_200 > 0 else 0
 
-    # Move cleanliness: ratio of up-closes to total in the move period
+    # Move cleanliness
     move_period = df.iloc[-min(len(df), 120):-15]
     if len(move_period) > 10:
         up_days = (move_period['Close'] > move_period['Open']).sum()
@@ -352,8 +362,9 @@ def score_stage(df, latest):
     is_early_s2 = sma200_up and price_above_200 and sma50_above_200 and base_count <= 1
     is_mid_s2 = sma200_up and price_above_200 and sma50_above_200 and base_count == 2
     is_late_s2 = sma200_up and price_above_200 and base_count >= 3
-    is_s1b = (sma200_flat or (not sma200_up and sma50_above_200)) and price_above_200
-    is_s1_early = not sma200_up and not sma200_flat and price_above_200
+    # S1b: 200DMA declining or flat, but price has reclaimed it, showing transition
+    is_s1b = (sma200_flat or sma200_flattening or (sma200_dn and price_above_200 and sma50_above_200)) and price_above_200
+    is_s1_early = not sma200_up and not sma200_flat and price_above_200 and not is_s1b
     is_s4_s1 = not sma200_up and not price_above_200
 
     # --- SCORING ---
@@ -371,7 +382,9 @@ def score_stage(df, latest):
     if sma200_up:
         score += 6
     elif sma200_flat:
-        score += 3
+        score += 4
+    elif sma200_flattening:
+        score += 3  # Declining but flattening — transition zone
     else:
         score += 0
 
@@ -379,7 +392,7 @@ def score_stage(df, latest):
     if is_early_s2:
         score += 8
     elif is_s1b:
-        score += 6
+        score += 6  # S1b is buyable per rules
     elif is_mid_s2:
         score += 5
     elif is_late_s2:
@@ -389,37 +402,46 @@ def score_stage(df, latest):
     else:
         score += 0
 
-    # Prior move quality (0-8) — THE KEY DIFFERENTIATOR
-    # CAT: 60%+ move. HINDCOPPER: 100%+. Delong: 200%+. All A+.
-    # Berger: barely recovering from decline. That's the difference.
+    # Prior move quality (0-8)
     if prior_move_pct >= 80:
-        score += 8  # Monster move — TDPOWERSYS, HINDCOPPER, Delong territory
+        score += 8
     elif prior_move_pct >= 50:
-        score += 6  # Strong move — CAT, TSM, INDIANB territory
+        score += 6
     elif prior_move_pct >= 30:
-        score += 4  # Decent move
+        score += 4
     elif prior_move_pct >= 15:
-        score += 2  # Weak move
+        score += 2
     else:
-        score += 0  # No real prior move — not a setup
+        score += 0
 
-    # Move cleanliness bonus (0-5): clean staircase > choppy
+    # Move cleanliness bonus (0-5)
     if move_cleanliness >= 55:
-        score += 5  # More up days than down — clean trend
+        score += 5
     elif move_cleanliness >= 50:
         score += 3
     else:
-        score += 1  # Choppy — Afzal explicitly dislikes this (Sagility comment)
+        score += 1
 
-    # --- HARD PENALTIES ---
+    # --- HARD PENALTIES (REVISED) ---
+    # v3: S1b with strong prior move gets a HIGHER cap
+    # The old blanket cap of 12 killed valid S1b setups like KNOWLEDG
     if not sma200_up and not sma200_flat:
-        score = min(score, 12)
-    if not price_above_200:
+        if is_s1b and prior_move_pct >= 50:
+            # S1b transition with strong prior move — allow up to 22
+            score = min(score, 22)
+        elif sma200_flattening and prior_move_pct >= 30:
+            # 200DMA almost flat + decent prior move — allow up to 18
+            score = min(score, 18)
+        else:
+            # Genuine decline, no prior move — hard cap
+            score = min(score, 12)
+    
+    if not price_above_200 and has_200dma:
         score -= 4
-    if not sma50_above_200:
+    if not sma50_above_200 and has_200dma:
         score -= 3
     if dist_from_200 > 35 and sma200_up:
-        score -= 2  # Overextended
+        score -= 2
 
     score = max(min(score, 33), 0)
 
@@ -436,7 +458,7 @@ def score_stage(df, latest):
 
     return score, {
         'MA Stack': stack_label,
-        '200DMA': "↑" if sma200_up else ("→" if sma200_flat else "↓"),
+        '200DMA': f"{'↑' if sma200_up else ('→' if sma200_flat else ('↗' if sma200_flattening else '↓'))} ({pct_change_200:+.1f}%)",
         'Stg': stg_label,
         'Bases': base_count,
         'Prior Move': f"{prior_move_pct:.0f}%",
@@ -446,9 +468,9 @@ def score_stage(df, latest):
 
 # ------------------------------------------------------------------
 # DIMENSION 3: TIMING (0-34)
-# What it checks: Is THIS the right moment to enter?
-# A+ timing: near 20DMA, volume dried up then expanding on trigger,
-# strong green candle with body in upper part, near breakout level
+# FIX v3: Fresh breakouts with volume are EXEMPT from extension
+#          penalty. Extension penalty only applies to stale moves
+#          (stock drifting up for days without a base).
 # ------------------------------------------------------------------
 def score_timing(df, latest):
     # --- Distance from 20DMA ---
@@ -456,27 +478,27 @@ def score_timing(df, latest):
     abs_dist = abs(pct_20dma)
 
     if abs_dist <= 2:
-        ma_pts = 10  # Right at the MA — ideal pullback entry
+        ma_pts = 10
     elif abs_dist <= 4:
         ma_pts = 7
     elif abs_dist <= 6:
         ma_pts = 4
     else:
-        ma_pts = 1  # Extended — not ideal timing
+        ma_pts = 1
 
     # --- Volume on trigger day vs base average ---
     vol_today = latest['Volume']
-    vol_base_avg = df['Volume'].iloc[-15:-1].mean()  # exclude today
+    vol_base_avg = df['Volume'].iloc[-15:-1].mean()
     vol_expansion = (vol_today / vol_base_avg) if vol_base_avg > 0 else 1
 
     if vol_expansion >= 2.0:
-        vol_pts = 8  # 2x+ volume on trigger — textbook (ANUPAMRAS had this)
+        vol_pts = 8
     elif vol_expansion >= 1.5:
         vol_pts = 6
     elif vol_expansion >= 1.0:
         vol_pts = 3
     else:
-        vol_pts = 1  # Below average volume — weak trigger
+        vol_pts = 1
 
     # --- Candle quality ---
     cr = latest['High'] - latest['Low']
@@ -485,55 +507,69 @@ def score_timing(df, latest):
     close_position = (latest['Close'] - latest['Low']) / cr if cr > 0 else 0.5
 
     if br > 0.6 and latest['Close'] > latest['Open'] and close_position > 0.7:
-        candle_pts = 8  # Strong green, closed near high — textbook trigger
+        candle_pts = 8
     elif br > 0.4 and latest['Close'] > latest['Open']:
-        candle_pts = 5  # Decent green
+        candle_pts = 5
     elif latest['Close'] > latest['Open']:
-        candle_pts = 3  # Weak green
+        candle_pts = 3
     else:
-        candle_pts = 0  # Red candle — not a trigger
+        candle_pts = 0
 
-    # --- Breakout proximity ---
-    # Check if this is a FRESH breakout (1-3 days) or stale (already running)
-    # HFCL-type bug: stock broke out 10 days ago, every day sets new 20-bar high
-    # That's NOT a setup — you're late. Fresh breakout = first 1-3 days above resistance.
+    # --- Breakout freshness ---
     high_50 = df['High'].iloc[-50:].max()
     pct_from_breakout = (high_50 - latest['Close']) / high_50 * 100
 
-    # Count how many of last 10 bars closed above the PRIOR 50-bar high
-    # (measured excluding those bars themselves)
     days_above_resistance = 0
     for i in range(-10, 0):
-        prior_high = df['High'].iloc[:len(df)+i-1].iloc[-50:].max()  # 50-bar high BEFORE that day
+        prior_high = df['High'].iloc[:len(df)+i-1].iloc[-50:].max()
         if df['Close'].iloc[i] > prior_high * 0.98:
             days_above_resistance += 1
 
     is_fresh_breakout = days_above_resistance <= 3 and latest['Close'] >= high_50 * 0.98
-    is_stale_breakout = days_above_resistance > 5  # Running for 5+ days — you're late
+    is_stale_breakout = days_above_resistance > 5
 
     if is_fresh_breakout:
-        bkout_pts = 8  # Fresh breakout — CAT, TSM, Delong moment
+        bkout_pts = 8
     elif pct_from_breakout <= 3 and not is_stale_breakout:
-        bkout_pts = 6  # Very close to breakout, not yet stale
+        bkout_pts = 6
     elif pct_from_breakout <= 8:
-        bkout_pts = 4  # Approaching
+        bkout_pts = 4
     elif is_stale_breakout:
-        bkout_pts = 0  # Already running — HFCL territory, NOT a setup
+        bkout_pts = 0
     else:
         bkout_pts = 1
 
-    # --- EXTENSION HARD PENALTY ---
-    # If stock is >10% above 20DMA, it's extended — no matter how good other metrics
-    # HFCL at +28% above 20DMA = chase, not a setup
+    # --- EXTENSION PENALTY (REVISED v3) ---
+    # KEY FIX: Fresh breakouts with volume are EXEMPT.
+    # A +14% breakout candle with 3x volume IS the setup — not "extended".
+    # Extension penalty only applies to stocks that drifted up gradually
+    # without a clear base/breakout pattern.
     extension_penalty = 0
-    if pct_20dma > 15:
-        extension_penalty = 12  # Severely extended — kill the timing score
-    elif pct_20dma > 10:
-        extension_penalty = 8   # Extended — big penalty
-    elif pct_20dma > 8:
-        extension_penalty = 4   # Getting stretched
+    is_volume_breakout = is_fresh_breakout and vol_expansion >= 1.5
 
-    raw_score = ma_pts + vol_pts + candle_pts + bkout_pts
+    if not is_volume_breakout:
+        # Only penalize if NOT a fresh volume breakout
+        if pct_20dma > 15:
+            extension_penalty = 12
+        elif pct_20dma > 10:
+            extension_penalty = 8
+        elif pct_20dma > 8:
+            extension_penalty = 4
+    else:
+        # Fresh breakout with volume: mild penalty only if extremely extended
+        if pct_20dma > 25:
+            extension_penalty = 6  # Even breakouts shouldn't be +25% above MA
+        elif pct_20dma > 20:
+            extension_penalty = 3
+
+    # --- BREAKOUT DAY BONUS (NEW) ---
+    # If this is a fresh volume breakout, give bonus points for MA distance
+    # because the extension IS the signal
+    breakout_bonus = 0
+    if is_volume_breakout and pct_20dma > 5:
+        breakout_bonus = min(int(pct_20dma / 3), 6)  # Up to 6 bonus pts for powerful breakouts
+
+    raw_score = ma_pts + vol_pts + candle_pts + bkout_pts + breakout_bonus
     score = max(min(raw_score - extension_penalty, 34), 0)
 
     return score, {
@@ -542,7 +578,8 @@ def score_timing(df, latest):
         'Body': f"{br:.0%}",
         'Close Pos': f"{close_position:.0%}",
         'Near Bkout': f"{pct_from_breakout:.1f}%",
-        'Bkout Age': f"{days_above_resistance}d"
+        'Bkout Age': f"{days_above_resistance}d",
+        'Fresh BO': "✅" if is_volume_breakout else "❌"
     }
 
 
