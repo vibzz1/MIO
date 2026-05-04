@@ -118,7 +118,9 @@ def check_stock(ticker, ind_map):
 
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:]).all()
+        # MIO: !(sma(20)<sma(50))@{0..20} — SMA20 not below SMA50 recently
+        # Use tolerance: SMA20 >= SMA50 * 0.99 to handle convergence in tight bases
+        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:] * 0.99).all()
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
