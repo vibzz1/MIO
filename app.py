@@ -118,7 +118,7 @@ def check_stock(ticker, ind_map):
 
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all()
+        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:]).all()
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
@@ -210,12 +210,12 @@ def score_base_quality(df, latest):
         score += 8  # Shallow relative to rally — KNOWLEDG, HINDCOPPER territory
     elif 3 <= dist_from_peak <= 15:
         score += 8
-    elif 1 <= dist_from_peak < 3:
-        score += 6
     elif 15 < dist_from_peak <= 25:
         score += 5 if depth_ratio <= 0.4 else 4  # Deeper but healthy if rally was big
+    elif 1 <= dist_from_peak < 3:
+        score += 3  # barely pulled back, questionable base
     elif dist_from_peak < 1:
-        score += 3  # at highs, no real base
+        score += 1  # at highs, definitely no base
     elif 25 < dist_from_peak <= 50 and depth_ratio <= 0.3:
         score += 5  # Deep in absolute terms but small relative to a monster rally
     else:
@@ -238,23 +238,52 @@ def score_base_quality(df, latest):
         score += 6
     elif vol_contraction >= 5:
         score += 4
+    elif vol_contraction >= -10:
+        score += 2
     else:
-        score += 1
+        score += 0  # volume expanding in "base" = not a base
 
-    # Base at resistance (0-5): near prior highs = better
-    # BUT: for stocks coming off a huge rally then basing, "resistance" is far above.
-    # In that case, reward forming at the base's OWN resistance (50-bar high).
+    # Base at resistance (0-5)
     if pct_from_resistance <= 5:
         score += 5
     elif pct_from_resistance <= 15:
         score += 3
     elif pct_from_resistance <= 30 and depth_ratio <= 0.3:
-        score += 3  # Far from ATH but healthy pullback from huge rally
+        score += 3
     else:
         score += 1
 
     # Tight closes bonus (0-4)
     score += min(tight_days, 4)
+
+    # ===== CONSOLIDATION EXISTENCE CHECK =====
+    # A real base = stock PAUSES in a tight range. No pause = no setup.
+    atr_20_pre = pre_trigger.get('ATR_20', 0)
+    if pd.isna(atr_20_pre) or atr_20_pre == 0:
+        atr_20_pre = df['ATR_20'].iloc[-2] if 'ATR_20' in df.columns else 1
+
+    ranging_days = 0
+    for i in range(-21, -1):
+        if abs(i) > len(df): continue
+        cc_change = abs(df['Close'].iloc[i] - df['Close'].iloc[i-1]) / df['Close'].iloc[i-1] * 100
+        day_range = (df['High'].iloc[i] - df['Low'].iloc[i])
+        if cc_change < 2.0 and day_range < atr_20_pre * 1.5:
+            ranging_days += 1
+
+    base_high = df['High'].iloc[-21:-1].max()
+    base_low_20 = df['Low'].iloc[-21:-1].min()
+    base_width_pct = (base_high - base_low_20) / base_high * 100 if base_high > 0 else 0
+
+    has_real_base = ranging_days >= 10 and 3 <= base_width_pct <= 20
+    no_base = ranging_days < 7
+
+    # HARD CAPS: NO BASE = NO SCORE
+    if no_base:
+        score = min(score, 5)
+    elif not has_real_base and dist_from_peak < 3:
+        score = min(score, 8)
+    if vol_contraction < -20:
+        score = min(score, 6)
 
     score = min(score, 33)
 
@@ -264,7 +293,9 @@ def score_base_quality(df, latest):
         'Vol Contr': f"{vol_contraction:.0f}%",
         'Near Res': f"{pct_from_resistance:.0f}%",
         'Depth/Rally': f"{depth_ratio:.2f}",
-        'Tight Days': tight_days
+        'Tight Days': tight_days,
+        'Range Days': f"{ranging_days}/20",
+        'Base Width': f"{base_width_pct:.1f}%",
     }
 
 
@@ -443,6 +474,10 @@ def score_stage(df, latest):
     if dist_from_200 > 35 and sma200_up:
         score -= 2
 
+    # LATE S2 HARD CAP: 3rd+ base = momentum exhausting, avoid per system rules
+    if is_late_s2:
+        score = min(score, 12)
+
     score = max(min(score, 33), 0)
 
     # --- Labels ---
@@ -508,12 +543,17 @@ def score_timing(df, latest):
 
     if br > 0.6 and latest['Close'] > latest['Open'] and close_position > 0.7:
         candle_pts = 8
-    elif br > 0.4 and latest['Close'] > latest['Open']:
+    elif br > 0.4 and latest['Close'] > latest['Open'] and close_position > 0.5:
         candle_pts = 5
+    elif br > 0.3 and latest['Close'] > latest['Open']:
+        candle_pts = 2
     elif latest['Close'] > latest['Open']:
-        candle_pts = 3
+        candle_pts = 1  # Weak green / doji
     else:
         candle_pts = 0
+
+    # Weak candle flag
+    is_weak_candle = br < 0.35 or (latest['Close'] <= latest['Open']) or close_position < 0.4
 
     # --- Breakout freshness ---
     high_50 = df['High'].iloc[-50:].max()
@@ -572,6 +612,12 @@ def score_timing(df, latest):
     raw_score = ma_pts + vol_pts + candle_pts + bkout_pts + breakout_bonus
     score = max(min(raw_score - extension_penalty, 34), 0)
 
+    # HARD CAPS: Weak trigger = not a setup
+    if is_weak_candle:
+        score = min(score, 10)
+    if vol_expansion < 0.8:
+        score = min(score, 8)
+
     return score, {
         'Dist 20DMA': f"{pct_20dma:+.1f}%",
         'Vol Exp': f"{vol_expansion:.1f}x",
@@ -579,7 +625,8 @@ def score_timing(df, latest):
         'Close Pos': f"{close_position:.0%}",
         'Near Bkout': f"{pct_from_breakout:.1f}%",
         'Bkout Age': f"{days_above_resistance}d",
-        'Fresh BO': "✅" if is_volume_breakout else "❌"
+        'Fresh BO': "✅" if is_volume_breakout else "❌",
+        'Candle': "Strong" if not is_weak_candle else "Weak"
     }
 
 
