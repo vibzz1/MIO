@@ -143,8 +143,8 @@ def check_stock(ticker, ind_map):
         c1 = latest['DVOL_20'] > 50_000_000
         c2 = latest['DVOL_50'] > 50_000_000
         # MIO: !(sma(20)<sma(50))@{0..20} — 21 bars, all must pass
-        # 2% tolerance handles yfinance vs MIO data feed differences
-        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:] * 0.98).all()
+        # 3.5% tolerance bridges yfinance vs MIO data feed gap
+        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:] * 0.965).all()
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
