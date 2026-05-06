@@ -93,12 +93,23 @@ def get_all_nse():
 # =============================================================================
 # SCREENER LOGIC (ORIGINAL — UNTOUCHED)
 # =============================================================================
+import threading
+_diag_lock = threading.Lock()
+_diag = {"data_fail": 0, "low_data": 0, "c1_vol20": 0, "c2_vol50": 0, "c3_sma_cross": 0,
+         "c4_below50_dn": 0, "c5_below10": 0, "c6_below20": 0, "c7_sma10_20": 0,
+         "c8_red_day": 0, "c9_low_atr": 0, "c10_close_pos": 0, "passed": 0, "checked": 0}
+
+def _diag_reset():
+    for k in _diag: _diag[k] = 0
+
 def check_stock(ticker, ind_map):
     symbol = f"{ticker}.NS"
     try:
         stock = yf.Ticker(symbol)
         df = stock.history(period="1y")
-        if len(df) < 70: return None
+        if len(df) < 70:
+            with _diag_lock: _diag["low_data"] += 1
+            return None
 
         df.dropna(inplace=True)
         df['SMA_10'] = ta.sma(df['Close'], length=10)
@@ -110,7 +121,11 @@ def check_stock(ticker, ind_map):
         df['ADVOL_50'] = df['Volume'].rolling(50).mean()
 
         df.dropna(inplace=True)
-        if len(df) < 22: return None
+        if len(df) < 22:
+            with _diag_lock: _diag["low_data"] += 1
+            return None
+
+        with _diag_lock: _diag["checked"] += 1
 
         sma50_trend_dn_20 = df['SMA_50'].iloc[-1] < df['SMA_50'].iloc[-21]
         latest = df.iloc[-1]
@@ -118,9 +133,7 @@ def check_stock(ticker, ind_map):
 
         c1 = latest['ADVOL_20'] > 50000
         c2 = latest['ADVOL_50'] > 50000
-        # MIO: !(sma(20)<sma(50))@{0..20} — SMA20 not below SMA50 recently
-        # Use tolerance: SMA20 >= SMA50 * 0.99 to handle convergence in tight bases
-        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:] * 0.99).all()
+        c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all()
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
@@ -129,14 +142,38 @@ def check_stock(ticker, ind_map):
         c9 = latest['ATR_1'] > (latest['ATR_20'] * 0.6)
         c10 = latest['Close'] > (latest['Low'] + ((latest['High'] - latest['Low']) * 0.4))
 
+        # Track which condition fails first
+        if not c1:
+            with _diag_lock: _diag["c1_vol20"] += 1
+        elif not c2:
+            with _diag_lock: _diag["c2_vol50"] += 1
+        elif not c3:
+            with _diag_lock: _diag["c3_sma_cross"] += 1
+        elif not c4:
+            with _diag_lock: _diag["c4_below50_dn"] += 1
+        elif not c5:
+            with _diag_lock: _diag["c5_below10"] += 1
+        elif not c6:
+            with _diag_lock: _diag["c6_below20"] += 1
+        elif not c7:
+            with _diag_lock: _diag["c7_sma10_20"] += 1
+        elif not c8:
+            with _diag_lock: _diag["c8_red_day"] += 1
+        elif not c9:
+            with _diag_lock: _diag["c9_low_atr"] += 1
+        elif not c10:
+            with _diag_lock: _diag["c10_close_pos"] += 1
+
         if all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]):
+            with _diag_lock: _diag["passed"] += 1
             industry = ind_map.get(ticker)
             if not industry or pd.isna(industry):
                 try: industry = stock.info.get('industry', 'N/A')
                 except: industry = 'N/A'
             return {"Ticker": ticker, "Industry": industry, "chart_data": df}
 
-    except: pass
+    except:
+        with _diag_lock: _diag["data_fail"] += 1
     return None
 
 # =============================================================================
@@ -775,6 +812,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
         st.error("Failed to pull market data. The NSE server might be busy.")
     else:
         st.info(f"⚡ Scanning {len(tickers)} stocks...")
+        _diag_reset()
 
         passed_results = []
         progress_bar = st.progress(0)
@@ -786,6 +824,29 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 if result: passed_results.append(result)
                 progress_bar.progress(min((i + 1) / len(tickers), 1.0))
         progress_bar.empty()
+
+        # --- DIAGNOSTIC BREAKDOWN ---
+        with st.expander("🔍 Scan Diagnostics — Where stocks drop off", expanded=True):
+            d = _diag.copy()
+            st.markdown(f"""
+| Stage | Count | Note |
+|---|---|---|
+| 📥 Tickers sent | **{len(tickers)}** | Universe |
+| ❌ Data fail (yfinance error) | **{d['data_fail']}** | API timeout / no data |
+| ❌ Low data (<70 bars) | **{d['low_data']}** | Insufficient history |
+| ✅ Actually checked | **{d['checked']}** | Had valid data |
+| ❌ c1: Vol20 < 50K | **{d['c1_vol20']}** | Low liquidity |
+| ❌ c2: Vol50 < 50K | **{d['c2_vol50']}** | Low liquidity |
+| ❌ c3: SMA20 < SMA50 | **{d['c3_sma_cross']}** | Not in uptrend |
+| ❌ c4: Below SMA50 + dn | **{d['c4_below50_dn']}** | Downtrend |
+| ❌ c5: Below SMA10 | **{d['c5_below10']}** | Below short MA |
+| ❌ c6: Below SMA20 | **{d['c6_below20']}** | Below 20DMA |
+| ❌ c7: SMA10 < SMA20 | **{d['c7_sma10_20']}** | MAs not stacked |
+| ❌ c8: Red day | **{d['c8_red_day']}** | Closed lower |
+| ❌ c9: Low ATR | **{d['c9_low_atr']}** | Weak range |
+| ❌ c10: Close position | **{d['c10_close_pos']}** | Closed in lower 40% |
+| ✅ **PASSED** | **{d['passed']}** | Setups found |
+""")
 
         if passed_results:
             st.success(f"🔥 Found {len(passed_results)} setups!")
