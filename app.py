@@ -142,7 +142,7 @@ def check_stock(ticker, ind_map):
         # MIO: advol(20) > 50 = dollar volume > 50 million INR
         c1 = latest['DVOL_20'] > 50_000_000
         c2 = latest['DVOL_50'] > 50_000_000
-        c3 = (df['SMA_20'].iloc[-5:] >= df['SMA_50'].iloc[-5:]).all()
+        c3 = (df['SMA_20'].iloc[-21:] >= df['SMA_50'].iloc[-21:]).all()
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
