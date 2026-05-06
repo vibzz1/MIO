@@ -139,9 +139,9 @@ def check_stock(ticker, ind_map):
         c1 = latest['ADVOL_20'] > 100000
         c2 = latest['ADVOL_50'] > 100000
         # MIO: !(sma(20)<sma(50))@{0..20}
-        # yfinance adjusted prices diverge from MIO raw NSE feed over 21-bar lookback
-        # Current bar check preserves intent; other conditions (c5-c7) enforce uptrend
-        c3 = latest['SMA_20'] >= latest['SMA_50']
+        # @{0..20} = condition at ALL bars. ! negates the result.
+        # = NOT(sma20 < sma50 at ALL 21 bars) = sma20 >= sma50 at SOME bar in 21
+        c3 = not (df['SMA_20'].iloc[-21:] < df['SMA_50'].iloc[-21:]).all()
         c4 = not (latest['Close'] < latest['SMA_50'] and sma50_trend_dn_20)
         c5 = latest['Close'] > latest['SMA_10']
         c6 = latest['Close'] > latest['SMA_20']
