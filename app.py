@@ -138,10 +138,11 @@ def check_stock(ticker, ind_map):
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # MIO: advol(20) > 100 — calibrated as dollar volume > ₹15M
-        # Share vol > 100K AND dollar vol > ₹15M (dual filter matches MIO universe)
-        c1 = latest['ADVOL_20'] > 100000 and latest['DVOL_20'] > 15_000_000
-        c2 = latest['ADVOL_50'] > 100000 and latest['DVOL_50'] > 15_000_000
+        # MIO: advol(20) > 100 = dollar volume > ₹100M (MIO docs: advol in millions)
+        # yfinance NSE volumes are ~6-7x lower than MIO (delivery vs total traded)
+        # Empirically calibrated: DVOL > ₹15M via yfinance ≈ MIO advol > 100
+        c1 = latest['DVOL_20'] > 15_000_000
+        c2 = latest['DVOL_50'] > 15_000_000
         # MIO: !(sma(20)<sma(50))@{0..20}
         # @{0..20} = condition at ALL bars. ! negates the result.
         # = NOT(sma20 < sma50 at ALL 21 bars) = sma20 >= sma50 at SOME bar in 21
@@ -847,8 +848,8 @@ if st.button("🚀 Run Market Scan", type="primary"):
 | ❌ Data fail (yfinance error) | **{d['data_fail']}** | API timeout / no data |
 | ❌ Low data (<70 bars) | **{d['low_data']}** | Insufficient history |
 | ✅ Actually checked | **{d['checked']}** | Had valid data |
-| ❌ c1: Vol/DolVol20 low | **{d['c1_vol20']}** | Low liquidity |
-| ❌ c2: Vol/DolVol50 low | **{d['c2_vol50']}** | Low liquidity |
+| ❌ c1: DolVol20 < ₹15M | **{d['c1_vol20']}** | Low turnover |
+| ❌ c2: DolVol50 < ₹15M | **{d['c2_vol50']}** | Low turnover |
 | ❌ c3: SMA20 < SMA50 | **{d['c3_sma_cross']}** | Not in uptrend |
 | ❌ c4: Below SMA50 + dn | **{d['c4_below50_dn']}** | Downtrend |
 | ❌ c5: Below SMA10 | **{d['c5_below10']}** | Below short MA |
