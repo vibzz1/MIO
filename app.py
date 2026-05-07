@@ -684,16 +684,85 @@ def score_timing(df, latest):
 
 
 # ------------------------------------------------------------------
+# VOLUME PROFILE (NEW — 25 pts)
+# ------------------------------------------------------------------
+def score_volume_profile(df, latest):
+    """
+    3 components:
+      1. Up/Down Volume Ratio (10) — accumulation signal
+      2. Base Volume Contraction (10) — supply absorbed during base
+      3. Today's Volume vs avg (5) — entry day confirmation
+    """
+    score = 0
+    detail = {}
+
+    # 1. Up/Down Vol Ratio over last 20 bars
+    last20 = df.iloc[-20:]
+    up_mask = last20['Close'] >= last20['Open']
+    up_vol = last20.loc[up_mask, 'Volume'].sum()
+    dn_vol = last20.loc[~up_mask, 'Volume'].sum()
+    ud_ratio = (up_vol / dn_vol) if dn_vol > 0 else 999.0
+
+    if ud_ratio >= 1.5:   ud_pts = 10
+    elif ud_ratio >= 1.2: ud_pts = 7
+    elif ud_ratio >= 1.0: ud_pts = 4
+    else:                 ud_pts = 0
+    score += ud_pts
+    detail['ud_ratio'] = round(min(ud_ratio, 99.0), 2)
+    detail['ud_pts'] = ud_pts
+
+    # 2. Volume Contraction: base (last 20) vs prior trend (50 bars before)
+    base_vol = df['Volume'].iloc[-20:].mean()
+    if len(df) >= 70:
+        trend_vol = df['Volume'].iloc[-70:-20].mean()
+    else:
+        trend_vol = df['Volume'].iloc[:-20].mean() if len(df) > 20 else base_vol
+    contraction = (base_vol / trend_vol) if trend_vol > 0 else 1.0
+
+    if contraction <= 0.70:   vc_pts = 10
+    elif contraction <= 0.90: vc_pts = 7
+    elif contraction <= 1.10: vc_pts = 4
+    else:                     vc_pts = 0
+    score += vc_pts
+    detail['contraction'] = round(contraction, 2)
+    detail['vc_pts'] = vc_pts
+
+    # 3. Today's Volume vs 50-day avg
+    today_vol = latest['Volume']
+    avg_vol = df['Volume'].iloc[-50:].mean()
+    vol_ratio = (today_vol / avg_vol) if avg_vol > 0 else 1.0
+
+    if vol_ratio >= 1.5:   tv_pts = 5
+    elif vol_ratio >= 1.0: tv_pts = 3
+    elif vol_ratio >= 0.7: tv_pts = 1
+    else:                  tv_pts = 0
+    score += tv_pts
+    detail['vol_ratio'] = round(vol_ratio, 2)
+    detail['tv_pts'] = tv_pts
+
+    score = max(min(score, 25), 0)
+    detail['total'] = score
+    return score, detail
+
+
+# ------------------------------------------------------------------
 # FINAL SCORE
 # ------------------------------------------------------------------
 def score_setup(res):
     df = _enrich_df(res['chart_data'].copy())
     latest = df.iloc[-1]
 
-    base_s, base_d = score_base_quality(df, latest)
-    stage_s, stage_d = score_stage(df, latest)
-    timing_s, timing_d = score_timing(df, latest)
-    total = base_s + stage_s + timing_s
+    base_s_raw, base_d = score_base_quality(df, latest)      # 0-33
+    stage_s_raw, stage_d = score_stage(df, latest)           # 0-33
+    timing_s_raw, timing_d = score_timing(df, latest)        # 0-34
+    volume_s, volume_d = score_volume_profile(df, latest)    # 0-25
+
+    # Rescale legacy scores to 25 each (preserves all existing tuning logic)
+    base_s = round(base_s_raw * 25 / 33)
+    stage_s = round(stage_s_raw * 25 / 33)
+    timing_s = round(timing_s_raw * 25 / 34)
+
+    total = base_s + stage_s + timing_s + volume_s  # 0-100
 
     if total >= 75: grade = "A+"
     elif total >= 60: grade = "A"
@@ -707,8 +776,10 @@ def score_setup(res):
     risk = round((entry - sl) / entry * 100, 1)
 
     return {'Grade': grade, 'Total': total, 'Base': base_s, 'Stage': stage_s,
-            'Timing': timing_s, 'Entry': round(entry, 2), 'SL': sl, 'Risk%': risk,
-            'base_det': base_d, 'stage_det': stage_d, 'timing_det': timing_d}
+            'Timing': timing_s, 'Volume': volume_s,
+            'Entry': round(entry, 2), 'SL': sl, 'Risk%': risk,
+            'base_det': base_d, 'stage_det': stage_d,
+            'timing_det': timing_d, 'volume_det': volume_d}
 
 
 # =============================================================================
@@ -778,9 +849,10 @@ def render_score_panel(res):
 
     st.markdown(f'<div class="grade-badge {grade_class}">{grade} · {total}/100</div>', unsafe_allow_html=True)
 
-    dims = [('🧱 Base', res.get('Base', 0), 33),
-            ('📶 Stage', res.get('Stage', 0), 33),
-            ('⏱️ Timing', res.get('Timing', 0), 34)]
+    dims = [('🧱 Base', res.get('Base', 0), 25),
+            ('📶 Stage', res.get('Stage', 0), 25),
+            ('⏱️ Timing', res.get('Timing', 0), 25),
+            ('📊 Volume', res.get('Volume', 0), 25)]
 
     for label, val, mx in dims:
         pct = int(val / mx * 100)
@@ -794,7 +866,7 @@ def render_score_panel(res):
     # Details
     st.markdown('<div style="margin-top:8px">', unsafe_allow_html=True)
     all_details = {}
-    for k in ['base_det', 'stage_det', 'timing_det']:
+    for k in ['base_det', 'stage_det', 'timing_det', 'volume_det']:
         all_details.update(res.get(k, {}))
     for label, value in all_details.items():
         st.markdown(f'<div class="detail-row"><span class="detail-label">{label}</span>'
@@ -865,7 +937,7 @@ if st.button("🚀 Run Market Scan", type="primary"):
         if passed_results:
             st.success(f"🔥 Found {len(passed_results)} setups!")
 
-            st.info("🧠 Scoring: Base · Stage · Timing...")
+            st.info("🧠 Scoring: Base · Stage · Timing · Volume...")
             scored_results = []
             for res in passed_results:
                 try:
@@ -873,8 +945,8 @@ if st.button("🚀 Run Market Scan", type="primary"):
                     scored_results.append({**res, **scores})
                 except:
                     scored_results.append({**res, 'Grade': '?', 'Total': 0, 'Base': 0,
-                        'Stage': 0, 'Timing': 0, 'Entry': 0, 'SL': 0, 'Risk%': 0,
-                        'base_det': {}, 'stage_det': {}, 'timing_det': {}})
+                        'Stage': 0, 'Timing': 0, 'Volume': 0, 'Entry': 0, 'SL': 0, 'Risk%': 0,
+                        'base_det': {}, 'stage_det': {}, 'timing_det': {}, 'volume_det': {}})
 
             scored_results.sort(key=lambda x: x.get('Total', 0), reverse=True)
 
@@ -887,9 +959,10 @@ if st.button("🚀 Run Market Scan", type="primary"):
                 row = {'Ticker': s['Ticker'], 'Industry': s['Industry'],
                        'Grade': s.get('Grade','?'), 'Score': s.get('Total',0),
                        'Base': s.get('Base',0), 'Stage': s.get('Stage',0),
-                       'Timing': s.get('Timing',0), 'CMP': s.get('Entry',0),
+                       'Timing': s.get('Timing',0), 'Volume': s.get('Volume',0),
+                       'CMP': s.get('Entry',0),
                        'SL': s.get('SL',0), 'Risk%': s.get('Risk%',0)}
-                for dk in ['base_det', 'stage_det', 'timing_det']:
+                for dk in ['base_det', 'stage_det', 'timing_det', 'volume_det']:
                     if s.get(dk): row.update(s[dk])
                 table_data.append(row)
 
